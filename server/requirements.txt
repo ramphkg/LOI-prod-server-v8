@@ -1,0 +1,23 @@
+#python=3.10
+
+pandas==1.5 #Pandas 2.2.3 only supports SQLAlchemy connectable (engine/connection)
+numpy==1.26.4
+SQLAlchemy==1.4.16
+PyMySQL==1.0.2
+mysql-connector-python==9.0.0
+#yfinance==0.1.67
+finnhub-python==2.4.20
+#ta-lib #- if errored, handle manually
+ta==0.7
+TA-Lib==0.6.7
+pandas-ta==0.3
+spicy==0.16.0
+eod==0.1.1
+ratelimit==2.2.1
+tenacity==9.1.2
+
+scikit-learn==1.7.2
+lightgbm==4.6.0
+joblib==1.5.2
+
+pyarrow>=21.0.0
