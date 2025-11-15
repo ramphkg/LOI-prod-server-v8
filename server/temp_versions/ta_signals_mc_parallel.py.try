@@ -1,0 +1,1438 @@
+#!/usr/bin/env python3
+"""
+ta_signals_mc_parallel.py
+
+Full module with:
+ - SQLAlchemy 2.x compatible DB usage (sqlalchemy.text, Connection.exec_driver_sql, param mappings)
+ - Defensive indicator computation (safe wrappers around pandas_ta) to avoid "'NoneType' object has no attribute 'iloc'" errors
+ - Canonical table schema, helpers for building technical signals and trend/reversal detection
+ - Worker and bulk-insert orchestration used by upstream scripts (swing_buy_recommender.py, build_tas_history.py)
+
+Notes:
+ - This file assumes several local project modules are present: app_imports, eod_api_prices, finnhub_api_prices,
+   SignalClassifier, TrendReversalDetector, TrendReversalDetectorFunction, indicators (some are optional).
+ - pandas_ta (pta) is used when available; the code tolerates its absence by returning NaNs for indicators.
+ - The file is defensive and logs issues rather than raising on indicator computation failures.
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+import time
+import traceback
+import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Optional, List, Tuple, Dict
+
+import numpy as np
+import pandas as pd
+from scipy import stats
+
+# Optional pandas_ta; import failure tolerated
+pta = None
+try:
+    import pandas_ta as pta
+except Exception as e:
+    warnings.warn(f"pandas_ta import failed or incompatible: {e}", ImportWarning)
+    pta = None
+
+# Local project imports - expected to be present in your environment
+from app_imports import getDbConnection, parallelLoggingSetter, printnlog, strUtcNow
+# Price fetchers (may wrap external API or local DB)
+try:
+    from eod_api_prices import eod_lastPriceDetails, get_historic_prices_from_eod
+except Exception:
+    def eod_lastPriceDetails(sym):
+        return {}
+    def get_historic_prices_from_eod(sym):
+        return pd.DataFrame()
+
+try:
+    from finnhub_api_prices import finnhub_lastPriceDetails, get_historic_prices_from_finnhub
+except Exception:
+    def finnhub_lastPriceDetails(sym):
+        return {}
+    def get_historic_prices_from_finnhub(sym):
+        return pd.DataFrame()
+
+# Signal detector/classifier modules (best-effort imports)
+try:
+    from SignalClassifier import SignalClassifier
+except Exception:
+    class SignalClassifier:
+        def __init__(self): pass
+        def get_rule_signal_int(self, df): return 0
+        def get_ml_signal_int(self, df): return 0
+
+try:
+    from TrendReversalDetector import TrendReversalDetector
+except Exception:
+    class TrendReversalDetector:
+        def __init__(self, df): pass
+        def signal(self): return None
+
+try:
+    from TrendReversalDetectorFunction import detect_reversal_pro
+except Exception:
+    def detect_reversal_pro(df):
+        return pd.NA
+
+try:
+    from TrendReversalDetectorML import detect_and_label_reversals
+except Exception:
+    def detect_and_label_reversals(df):
+        return pd.NA
+
+# Optional generic indicators module (if you have one); we will provide safe computation below too
+try:
+    from indicators import compute_indicators  # optional
+except Exception:
+    compute_indicators = None
+
+# SQLAlchemy helper
+from sqlalchemy import text
+
+# Module-level flag controlling ML usage
+USE_ML: bool = True
+
+# -------------------------
+# Canonical schema
+# -------------------------
+def canonical_table_schema() -> Dict[str, str]:
+    return {
+        "Date": "DATE",
+        "Open": "DOUBLE PRECISION",
+        "High": "DOUBLE PRECISION",
+        "Low": "DOUBLE PRECISION",
+        "Close": "DOUBLE PRECISION",
+        "Volume": "BIGINT",
+        "Symbol": "VARCHAR(191)",
+        "ADX": "DOUBLE PRECISION",
+        "DITrend": "VARCHAR(16)",
+        "SMA200": "DOUBLE PRECISION",
+        "EMA50": "DOUBLE PRECISION",
+        "EMA20": "DOUBLE PRECISION",
+        "CCI": "DOUBLE PRECISION",
+        "RSI": "DOUBLE PRECISION",
+        "MA_Trend": "VARCHAR(16)",
+        "MADI_Trend": "VARCHAR(16)",
+        "TMA21_50_X": "SMALLINT",
+        "TodayPrice": "DOUBLE PRECISION",
+        "marketCap": "DOUBLE PRECISION",
+        "GEM_Rank": "VARCHAR(32)",
+        "CountryName": "VARCHAR(191)",
+        "IndustrySector": "VARCHAR(64)",
+        "High52": "DOUBLE PRECISION",
+        "Low52": "DOUBLE PRECISION",
+        "Pct2H52": "DOUBLE PRECISION",
+        "PctfL52": "DOUBLE PRECISION",
+        "RSIUturnTypeOld": "VARCHAR(64)",
+        "TrendReversal_Rules": "VARCHAR(64)",
+        "TrendReversal_ML": "VARCHAR(64)",
+        "RSIUpTrend": "BOOLEAN",
+        "LastTrendDays": "INTEGER",
+        "LastTrendType": "VARCHAR(32)",
+        "Trend": "VARCHAR(64)",
+        "ScanDate": "TIMESTAMP",
+        "SignalClassifier_Rules": "INTEGER",
+        "SignalClassifier_ML": "INTEGER"
+    }
+
+# -------------------------
+# SQLAlchemy-safe helpers
+# -------------------------
+def ensure_output_table(table_name: str, my_logger=None) -> None:
+    """
+    Ensure table exists and has canonical schema. SQLAlchemy 2.x style:
+      - use text(...) for parameterized selects
+      - use Connection.exec_driver_sql for DDL strings
+      - pass parameters as a single mapping (dict)
+    """
+    if my_logger is None:
+        try:
+            my_logger = parallelLoggingSetter("ensure_output_table")
+        except Exception:
+            my_logger = logging.getLogger("ensure_output_table")
+            if not my_logger.handlers:
+                logging.basicConfig(level=logging.INFO)
+
+    schema = canonical_table_schema()
+    mysql_type_map = {
+        "DOUBLE PRECISION": "DOUBLE",
+        "BOOLEAN": "TINYINT(1)",
+        "INTEGER": "INT",
+        "SMALLINT": "SMALLINT",
+        "BIGINT": "BIGINT",
+    }
+
+    def _sql_type_for_mysql(ctype: str) -> str:
+        out = ctype
+        for k, v in mysql_type_map.items():
+            out = out.replace(k, v)
+        return out
+
+    try:
+        with getDbConnection() as con:
+            q_table = f'`{table_name}`'
+            col_defs = [f'`{col}` {_sql_type_for_mysql(ctype)}' for col, ctype in schema.items()]
+            create_sql = f'CREATE TABLE IF NOT EXISTS {q_table} ({", ".join(col_defs)}) ENGINE=InnoDB;'
+            try:
+                con.exec_driver_sql(create_sql)
+                my_logger.info(f"[ensure_output_table] CREATE TABLE IF NOT EXISTS executed for {table_name}")
+            except Exception as e:
+                my_logger.warning(f"[ensure_output_table] CREATE TABLE issued with warning: {e}")
+
+            # Ensure columns exist using INFORMATION_SCHEMA with named params
+            for col, ctype in schema.items():
+                q_check = text("""
+                    SELECT DATA_TYPE, CHARACTER_MAXIMUM_LENGTH
+                    FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :tname AND COLUMN_NAME = :col
+                """)
+                data_type = None
+                char_max = None
+                try:
+                    res = con.execute(q_check, {"tname": table_name, "col": col})
+                    row = res.fetchone()
+                    if row:
+                        data_type = row[0]
+                        char_max = row[1]
+                except Exception as ie:
+                    my_logger.error(f"[ensure_output_table] INFORMATION_SCHEMA query failed for {table_name}.{col}: {ie}")
+                    raise
+
+                if data_type is None:
+                    add_sql = f'ALTER TABLE {q_table} ADD COLUMN `{col}` {_sql_type_for_mysql(ctype)};'
+                    try:
+                        con.exec_driver_sql(add_sql)
+                        my_logger.info(f"[ensure_output_table] Added missing column `{col}` to {table_name}")
+                    except Exception as e:
+                        my_logger.error(f"[ensure_output_table] Failed to add column `{col}` to {table_name}: {e}\nSQL: {add_sql}")
+                        raise
+                else:
+                    my_logger.debug(f"[ensure_output_table] Column {col} already exists in {table_name} (type={data_type}, char_max={char_max})")
+
+            # Ensure simple indexes (name-based) if missing
+            idx_defs = {
+                f'idx_{table_name}_symbol': ('Symbol',),
+                f'idx_{table_name}_country': ('CountryName',),
+                f'idx_{table_name}_date': ('Date',)
+            }
+            for idx_name, cols in idx_defs.items():
+                q_idx_check = text("""
+                    SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS
+                    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :tname AND INDEX_NAME = :iname
+                """)
+                try:
+                    res = con.execute(q_idx_check, {"tname": table_name, "iname": idx_name})
+                    r = res.fetchone()
+                    idx_cnt = int(r[0]) if r is not None else 0
+                except Exception:
+                    idx_cnt = 0
+
+                if idx_cnt == 0:
+                    col = cols[0]
+                    try:
+                        meta_res = con.execute(text("""
+                            SELECT DATA_TYPE, CHARACTER_MAXIMUM_LENGTH
+                            FROM INFORMATION_SCHEMA.COLUMNS
+                            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :tname AND COLUMN_NAME = :col
+                        """), {"tname": table_name, "col": col})
+                        meta = meta_res.fetchone()
+                        data_type = meta[0] if meta is not None else None
+                        char_max = meta[1] if meta is not None else None
+                    except Exception:
+                        data_type = None
+                        char_max = None
+
+                    if data_type is not None and str(data_type).lower() in ('text', 'mediumtext', 'longtext', 'tinytext'):
+                        prefix = min(191, int(char_max) if char_max else 191)
+                        create_idx_sql = f'CREATE INDEX `{idx_name}` ON {q_table} (`{col}`({prefix}));'
+                    elif data_type is not None and str(data_type).lower() in ('varchar', 'char'):
+                        if char_max and int(char_max) > 191:
+                            prefix = 191
+                            create_idx_sql = f'CREATE INDEX `{idx_name}` ON {q_table} (`{col}`({prefix}));'
+                        else:
+                            create_idx_sql = f'CREATE INDEX `{idx_name}` ON {q_table} (`{col}`);'
+                    else:
+                        create_idx_sql = f'CREATE INDEX `{idx_name}` ON {q_table} (`{col}`);'
+
+                    try:
+                        con.exec_driver_sql(create_idx_sql)
+                        my_logger.info(f"[ensure_output_table] Created index {idx_name} on {table_name}({', '.join(cols)})")
+                    except Exception as e:
+                        my_logger.warning(f"[ensure_output_table] Failed to create index {idx_name} on {table_name}: {e} -- SQL: {create_idx_sql} (continuing)")
+                else:
+                    my_logger.debug(f"[ensure_output_table] Index {idx_name} already present on {table_name}")
+
+    except Exception as final_e:
+        my_logger.error(f"[ensure_output_table] Fatal error ensuring table {table_name}: {final_e}\n{traceback.format_exc()}")
+        raise
+
+# -------------------------
+# Price history wrappers (SQLAlchemy-safe queries)
+# -------------------------
+def get_historic_prices_from_finnhub_local(symbol: str) -> pd.DataFrame:
+    with getDbConnection() as con:
+        q = text("""
+            SELECT symbol, date AS Date, open AS Open, high AS High, low AS Low, close AS Close, volume AS Volume
+            FROM finnhub_stock_prices
+            WHERE symbol = :symbol
+            ORDER BY date ASC
+        """)
+        df = pd.read_sql_query(q, con=con, params={"symbol": symbol})
+    return df
+
+def get_historic_prices_from_eod_local(symbol: str) -> pd.DataFrame:
+    with getDbConnection() as con:
+        q = text("""
+            SELECT symbol, date AS Date, open AS Open, high AS High, low AS Low, close AS Close, volume AS Volume
+            FROM eod_stock_prices
+            WHERE symbol = :symbol
+            ORDER BY date ASC
+        """)
+        df = pd.read_sql_query(q, con=con, params={"symbol": symbol})
+    return df
+
+# -------------------------
+# initialize_config
+# -------------------------
+def initialize_config(price_source: str) -> dict:
+    config = {}
+    config['PRICE_SOURCE'] = price_source.upper()
+    config['DIWidth_Strong_threshold'] = 15
+    config['DIWidth_Average_threshold'] = 10
+    config['ADX_Strong_threshold'] = 25
+    config['ADX_Average_threshold'] = 20
+    config['EMA_CROSS_LOOKBACK'] = 3
+    config['SMA_CROSS_LOOKBACK'] = 10
+    config['HISTORY_BARS'] = 600
+
+    ps = config['PRICE_SOURCE']
+    if ps == 'FINNHUB':
+        config['tal_master_tablename'] = 'finnhub_tas_listings'
+        config['FUNDAMENTALS_TABLENAME'] = "finnhub_gem_listings"
+        config['CLOSING_PRICES_FUNCTION'] = get_historic_prices_from_finnhub
+        config['LAST_PRICES_DETLS_FUNCTION'] = finnhub_lastPriceDetails
+        config['WATCHLIST_TABLENAME'] = "finnhub_watchlist"
+    elif ps == 'FINNHUB_LOCAL':
+        config['tal_master_tablename'] = 'finnhub_tas_listings'
+        config['FUNDAMENTALS_TABLENAME'] = "finnhub_gem_listings"
+        config['CLOSING_PRICES_FUNCTION'] = get_historic_prices_from_finnhub_local
+        config['LAST_PRICES_DETLS_FUNCTION'] = finnhub_lastPriceDetails
+        config['WATCHLIST_TABLENAME'] = "finnhub_watchlist"
+    elif ps == 'EOD':
+        config['tal_master_tablename'] = 'eod_tas_listings'
+        config['FUNDAMENTALS_TABLENAME'] = "eod_gem_listings"
+        config['CLOSING_PRICES_FUNCTION'] = get_historic_prices_from_eod
+        config['LAST_PRICES_DETLS_FUNCTION'] = eod_lastPriceDetails
+        config['WATCHLIST_TABLENAME'] = "eod_watchlist"
+    elif ps == 'EOD_LOCAL':
+        config['tal_master_tablename'] = 'eod_tas_listings'
+        config['FUNDAMENTALS_TABLENAME'] = "eod_gem_listings"
+        config['CLOSING_PRICES_FUNCTION'] = get_historic_prices_from_eod_local
+        config['LAST_PRICES_DETLS_FUNCTION'] = eod_lastPriceDetails
+        config['WATCHLIST_TABLENAME'] = "eod_watchlist"
+    else:
+        raise ValueError(f"Invalid PRICE_SOURCE: {ps}")
+
+    config['tal_temp_tablename'] = config['tal_master_tablename'] + '_temp'
+    return config
+
+def get_country_name(watchlist: str) -> str:
+    wl_country_names = {'US': 'USA', 'IN': 'India', 'BS': 'India-BSE', 'HK': 'Hong Kong'}
+    if len(watchlist) >= 2:
+        country_code = watchlist[:2].upper()
+        return wl_country_names.get(country_code, "Unknown")
+    else:
+        return "Invalid"
+
+# -------------------------
+# Defensive indicator helpers
+# -------------------------
+def _safe_pta_call(func, *args, expect_series=True, df_index=None, default_name=None, **kwargs):
+    """
+    Safe wrapper around pandas_ta (or similar) indicator calls. Returns a pd.Series or pd.DataFrame
+    with length matching df_index when provided; otherwise returns the original object transformed to pd.Series/DataFrame.
+    """
+    try:
+        res = func(*args, **kwargs)
+    except Exception as e:
+        warnings.warn(f"Indicator call {getattr(func, '__name__', str(func))} failed: {e}", RuntimeWarning)
+        if df_index is not None:
+            return pd.Series([np.nan] * len(df_index), index=df_index, name=default_name)
+        return pd.Series(dtype=float)
+
+    if res is None:
+        if df_index is not None:
+            return pd.Series([np.nan] * len(df_index), index=df_index, name=default_name)
+        return pd.Series(dtype=float)
+
+    if isinstance(res, pd.DataFrame):
+        if df_index is not None:
+            try:
+                return res.reindex(df_index)
+            except Exception:
+                return res
+        return res
+
+    if isinstance(res, pd.Series):
+        if df_index is not None:
+            try:
+                return res.reindex(df_index)
+            except Exception:
+                return res
+        return res
+
+    # If numpy array or scalar => convert to Series with df_index
+    try:
+        arr = np.asarray(res)
+        if df_index is not None:
+            if arr.ndim == 0:
+                return pd.Series([float(arr)] * len(df_index), index=df_index, name=default_name)
+            if arr.shape[0] == len(df_index):
+                return pd.Series(arr, index=df_index, name=default_name)
+            return pd.Series([np.nan] * len(df_index), index=df_index, name=default_name)
+        else:
+            return pd.Series(arr, name=default_name)
+    except Exception:
+        if df_index is not None:
+            return pd.Series([np.nan] * len(df_index), index=df_index, name=default_name)
+        return pd.Series(dtype=float)
+
+
+def compute_indicators_safe(df: pd.DataFrame, params: dict = None) -> pd.DataFrame:
+    """
+    Robust computation of common indicators: RSI, CCI, ADX (with DI+/-), OBV, ATR, Bollinger Bands, EMAs.
+    Fills NaNs where computation is not possible.
+    """
+    if params is None:
+        params = {}
+    rsi_period = int(params.get("rsi_period", 14))
+    cci_period = int(params.get("cci_period", 20))
+    adx_period = int(params.get("adx_period", 14))
+    macd_fast = int(params.get("macd_fast", 12))
+    macd_slow = int(params.get("macd_slow", 26))
+    macd_sig = int(params.get("macd_sig", 9))
+    length_bb = int(params.get("bb_length", 20))
+    bb_std = float(params.get("bb_std", 2.0))
+
+    out = df.copy() if df is not None else pd.DataFrame()
+    idx = out.index if out is not None else pd.Index([])
+
+    # If df is empty or lacks Close, create NaN columns
+    if df is None or df.empty or 'Close' not in df.columns:
+        nan_series = pd.Series([np.nan] * len(idx), index=idx)
+        for col in ['RSI', 'CCI', 'ADX', 'DIPLUS', 'DIMINUS', 'OBV', 'ATR',
+                    'BBU_20_2.0', 'BBM_20_2.0', 'BBL_20_2.0', 'EMA20', 'EMA50', 'EMA200']:
+            out[col] = nan_series
+        return out
+
+    # RSI
+    if 'RSI' not in out.columns:
+        if pta is not None:
+            rsi = _safe_pta_call(pta.rsi, close=out['Close'], length=rsi_period, df_index=idx, default_name='RSI')
+        else:
+            rsi = pd.Series([np.nan] * len(idx), index=idx, name='RSI')
+        out['RSI'] = rsi
+
+    # CCI
+    if 'CCI' not in out.columns:
+        if pta is not None:
+            cci = _safe_pta_call(pta.cci, high=out.get('High', out['Close']), low=out.get('Low', out['Close']),
+                                 close=out['Close'], length=cci_period, df_index=idx, default_name='CCI')
+        else:
+            cci = pd.Series([np.nan] * len(idx), index=idx, name='CCI')
+        out['CCI'] = cci
+
+    # ADX + DI lines
+    if not all(k in out.columns for k in ('ADX', 'DIPLUS', 'DIMINUS')):
+        if pta is not None:
+            adx_df = _safe_pta_call(pta.adx, high=out.get('High', out['Close']), low=out.get('Low', out['Close']),
+                                    close=out['Close'], length=adx_period, df_index=idx)
+            if isinstance(adx_df, pd.DataFrame):
+                # attempt to find common column names
+                if 'ADX_14' in adx_df.columns:
+                    out['ADX'] = adx_df['ADX_14'].reindex(idx)
+                elif 'adx' in adx_df.columns:
+                    out['ADX'] = adx_df['adx'].reindex(idx)
+                else:
+                    out['ADX'] = pd.Series([np.nan] * len(idx), index=idx)
+                # DI+
+                for cand in ('DMP_14', 'DIP_14', 'plus_di', 'DI+'):
+                    if cand in adx_df.columns:
+                        out['DIPLUS'] = adx_df[cand].reindex(idx); break
+                else:
+                    out['DIPLUS'] = pd.Series([np.nan] * len(idx), index=idx)
+                # DI-
+                for cand in ('DMM_14', 'DIN_14', 'minus_di', 'DI-'):
+                    if cand in adx_df.columns:
+                        out['DIMINUS'] = adx_df[cand].reindex(idx); break
+                else:
+                    out['DIMINUS'] = pd.Series([np.nan] * len(idx), index=idx)
+            else:
+                out['ADX'] = pd.Series([np.nan] * len(idx), index=idx)
+                out['DIPLUS'] = pd.Series([np.nan] * len(idx), index=idx)
+                out['DIMINUS'] = pd.Series([np.nan] * len(idx), index=idx)
+        else:
+            out['ADX'] = pd.Series([np.nan] * len(idx), index=idx)
+            out['DIPLUS'] = pd.Series([np.nan] * len(idx), index=idx)
+            out['DIMINUS'] = pd.Series([np.nan] * len(idx), index=idx)
+
+    # OBV
+    if 'OBV' not in out.columns:
+        if pta is not None and 'Volume' in out.columns:
+            obv = _safe_pta_call(pta.obv, close=out['Close'], volume=out['Volume'], df_index=idx, default_name='OBV')
+            out['OBV'] = obv
+        else:
+            out['OBV'] = pd.Series([np.nan] * len(idx), index=idx)
+
+    # ATR
+    if 'ATR' not in out.columns:
+        if pta is not None:
+            atr = _safe_pta_call(pta.atr, high=out.get('High', out['Close']), low=out.get('Low', out['Close']),
+                                 close=out['Close'], length=14, df_index=idx, default_name='ATR')
+            out['ATR'] = atr
+        else:
+            out['ATR'] = pd.Series([np.nan] * len(idx), index=idx)
+
+    # Bollinger bands
+    if 'BBU_20_2.0' not in out.columns:
+        if pta is not None:
+            bb = _safe_pta_call(pta.bbands, close=out['Close'], length=length_bb, std=bb_std, df_index=idx)
+            if isinstance(bb, pd.DataFrame):
+                # many pandas_ta versions differ in column names
+                if 'BBU_20_2.0' in bb.columns:
+                    out['BBU_20_2.0'] = bb['BBU_20_2.0'].reindex(idx)
+                elif 'BBUP_20_2.0' in bb.columns:
+                    out['BBU_20_2.0'] = bb['BBUP_20_2.0'].reindex(idx)
+                elif 0 in bb.columns:
+                    out['BBU_20_2.0'] = bb.iloc[:, 0].reindex(idx)
+                else:
+                    out['BBU_20_2.0'] = pd.Series([np.nan] * len(idx), index=idx)
+
+                if 'BBM_20_2.0' in bb.columns:
+                    out['BBM_20_2.0'] = bb['BBM_20_2.0'].reindex(idx)
+                elif 1 in bb.columns:
+                    out['BBM_20_2.0'] = bb.iloc[:, 1].reindex(idx)
+                else:
+                    out['BBM_20_2.0'] = pd.Series([np.nan] * len(idx), index=idx)
+
+                if 'BBL_20_2.0' in bb.columns:
+                    out['BBL_20_2.0'] = bb['BBL_20_2.0'].reindex(idx)
+                elif 2 in bb.columns:
+                    out['BBL_20_2.0'] = bb.iloc[:, 2].reindex(idx)
+                else:
+                    out['BBL_20_2.0'] = pd.Series([np.nan] * len(idx), index=idx)
+            else:
+                out['BBU_20_2.0'] = pd.Series([np.nan] * len(idx), index=idx)
+                out['BBM_20_2.0'] = pd.Series([np.nan] * len(idx), index=idx)
+                out['BBL_20_2.0'] = pd.Series([np.nan] * len(idx), index=idx)
+        else:
+            out['BBU_20_2.0'] = pd.Series([np.nan] * len(idx), index=idx)
+            out['BBM_20_2.0'] = pd.Series([np.nan] * len(idx), index=idx)
+            out['BBL_20_2.0'] = pd.Series([np.nan] * len(idx), index=idx)
+
+    # EMAs (fallback to pandas ewm if pta missing)
+    def _safe_ema(series, length, name):
+        if name in out.columns:
+            return out[name]
+        try:
+            if pta is not None:
+                s = _safe_pta_call(pta.ema, close=out['Close'], length=int(length), df_index=idx, default_name=name)
+            else:
+                s = out['Close'].ewm(span=int(length), adjust=False).mean()
+                s = s.reindex(idx)
+            return s
+        except Exception:
+            return pd.Series([np.nan] * len(idx), index=idx, name=name)
+
+    out['EMA20'] = _safe_ema(out['Close'], 20, 'EMA20')
+    out['EMA50'] = _safe_ema(out['Close'], 50, 'EMA50')
+    out['EMA200'] = _safe_ema(out['Close'], 200, 'EMA200')
+
+    # Ensure expected columns exist
+    expected = ['RSI', 'CCI', 'ADX', 'DIPLUS', 'DIMINUS', 'OBV', 'ATR',
+                'BBU_20_2.0', 'BBM_20_2.0', 'BBL_20_2.0', 'EMA20', 'EMA50', 'EMA200']
+    for col in expected:
+        if col not in out.columns:
+            out[col] = pd.Series([np.nan] * len(idx), index=idx)
+
+    return out
+
+# Legacy compatibility wrapper
+def get_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Backwards-compatible function: compute indicators via compute_indicators (if present),
+    else use compute_indicators_safe.
+    """
+    try:
+        if compute_indicators is not None:
+            try:
+                # compute_indicators may raise for some inputs; if so, fallback to safe
+                df2 = compute_indicators(df, params={"rsi_period": 14, "cci_period": 20, "adx_period": 14})
+                # ensure expected casing/columns mapping if compute_indicators provided lowercase names
+                # We'll still run compute_indicators_safe to fill missing/NaN values robustly
+                df_combined = compute_indicators_safe(df2, params={"rsi_period": 14, "cci_period": 20, "adx_period": 14})
+                return df_combined
+            except Exception:
+                return compute_indicators_safe(df, params={"rsi_period": 14, "cci_period": 20, "adx_period": 14})
+        else:
+            return compute_indicators_safe(df, params={"rsi_period": 14, "cci_period": 20, "adx_period": 14})
+    except Exception as e:
+        warnings.warn(f"get_technical_indicators failed: {e}", RuntimeWarning)
+        return compute_indicators_safe(df, params={"rsi_period": 14, "cci_period": 20, "adx_period": 14})
+
+# -------------------------
+# Trend/Reversal detection helpers
+# -------------------------
+def get_lasttrend_days(df: pd.DataFrame) -> int:
+    if df is None or df.empty or 'Close' not in df.columns:
+        return 0
+    if df['Close'].max() == df['Close'].min():
+        return 0
+    days = 0
+    prevtrend = None
+    for idx in range(len(df) - 1, 0, -1):
+        price = float(df.at[idx, 'Close'])
+        prevprice = float(df.at[idx - 1, 'Close'])
+        trend = -1 if price < prevprice else 1
+        if prevtrend is None:
+            prevtrend = trend
+        if trend != prevtrend:
+            break
+        days += 1
+        prevtrend = trend
+    return days * prevtrend
+
+def detect_rsi_uptrend(df: pd.DataFrame,
+                       downturn_lookback: int = 12,
+                       upturn_lookback: int = 5,
+                       oversold_threshold: float = 35.0,
+                       exit_oversold: float = 30.0,
+                       min_downturn_bars: int = 4,
+                       min_slope_threshold: float = 0.02,
+                       rsi_smoothing: int = 2,
+                       p_value_threshold: float = 0.2,
+                       strength_threshold: float = 50.0,
+                       debug: bool = False) -> Tuple[bool, float]:
+    if df is None or df.empty or 'RSI' not in df.columns or len(df) < (downturn_lookback + upturn_lookback + 1):
+        if debug: print("ERR: Insufficient data or no RSI")
+        return False, 0.0
+
+    rsi_ser = df['RSI'].dropna()
+    if len(rsi_ser) < (downturn_lookback + upturn_lookback):
+        if debug: print("ERR: Too few RSI values")
+        return False, 0.0
+
+    if rsi_smoothing > 1:
+        rsi_ser = rsi_ser.ewm(span=rsi_smoothing).mean()
+
+    recent_rsi = rsi_ser.iloc[-upturn_lookback:]
+    prior_rsi = rsi_ser.iloc[-(downturn_lookback + upturn_lookback):-upturn_lookback]
+
+    if len(prior_rsi) < min_downturn_bars:
+        if debug: print(f"ERR: Prior window too short ({len(prior_rsi)} < {min_downturn_bars})")
+        return False, 0.0
+
+    x_prior = np.arange(len(prior_rsi))
+    slope_prior, _, _, p_prior, _ = stats.linregress(x_prior, prior_rsi.to_numpy())
+    downturn_confirmed = (
+        slope_prior < -min_slope_threshold and
+        p_prior < p_value_threshold and
+        prior_rsi.iloc[-1] < oversold_threshold
+    )
+    if debug: print(f"Downturn check: slope={slope_prior:.3f}, p={p_prior:.3f}, end={prior_rsi.iloc[-1]:.1f} -> {downturn_confirmed}")
+    if not downturn_confirmed:
+        return False, 0.0
+
+    x_recent = np.arange(len(recent_rsi))
+    slope_recent, _, _, p_recent, _ = stats.linregress(x_recent, recent_rsi.to_numpy())
+    net_increase = recent_rsi.iloc[-1] - recent_rsi.iloc[0]
+    small_dips_ok = (recent_rsi.diff().dropna() >= -recent_rsi.iloc[-1] * 0.08).all()
+    crosses_exit = (recent_rsi.iloc[-1] > exit_oversold) and (recent_rsi.min() <= exit_oversold)
+    uptrend_confirmed = (
+        slope_recent > min_slope_threshold and
+        p_recent < p_value_threshold and
+        net_increase > 0 and
+        small_dips_ok and
+        crosses_exit
+    )
+    if debug: print(f"Upturn check: slope={slope_recent:.3f}, p={p_recent:.3f}, net={net_increase:.1f}, dips_ok={small_dips_ok}, cross={crosses_exit} -> {uptrend_confirmed}")
+    if not uptrend_confirmed:
+        return False, 0.0
+
+    strength = 100.0
+    is_uptrend = strength >= strength_threshold
+    return is_uptrend, round(strength, 1)
+
+def _extract_indicator_value(series_or_df, key=None, want_last=1):
+    """
+    Safely extract last (or last two) values from a Series or DataFrame.
+    Returns scalar or tuple (last, prev) depending on want_last.
+    """
+    if series_or_df is None:
+        return (np.nan, np.nan) if want_last == 2 else np.nan
+    try:
+        if isinstance(series_or_df, pd.DataFrame):
+            if key and key in series_or_df.columns:
+                series = series_or_df[key]
+            elif series_or_df.shape[1] >= 1:
+                series = series_or_df.iloc[:, 0]
+            else:
+                return (np.nan, np.nan) if want_last == 2 else np.nan
+        else:
+            series = series_or_df
+
+        if series is None or series.empty or series.dropna().empty:
+            return (np.nan, np.nan) if want_last == 2 else np.nan
+
+        if want_last == 1:
+            return series.iloc[-1] if len(series) >= 1 else np.nan
+        else:
+            if len(series) >= 2:
+                return series.iloc[-1], series.iloc[-2]
+            elif len(series) == 1:
+                return series.iloc[-1], np.nan
+            else:
+                return (np.nan, np.nan)
+    except Exception:
+        return (np.nan, np.nan) if want_last == 2 else np.nan
+
+def detect_trend_reversal(df, min_prior_trend_days=4, min_current_trend_days=1,
+                          period_cci=20, period_rsi=14, atr_multiplier=1.5):
+    """
+    Detect reversals using robust indicator extraction (no direct .iloc on possibly None results).
+    Returns a label string or ERR_* codes.
+    """
+    required_cols = ['Date', 'Close', 'High', 'Low', 'Volume']
+    if not all(col in df.columns for col in required_cols):
+        return "ERR_MISSING_COLS"
+    try:
+        df_sorted = df.copy()
+        df_sorted['Date'] = pd.to_datetime(df_sorted['Date'])
+        df_sorted = df_sorted.sort_values('Date').reset_index(drop=True)
+    except (ValueError, TypeError):
+        return "ERR_INVALID_DATE"
+
+    required_length = max(period_cci, period_rsi, 252) + min_prior_trend_days + min_current_trend_days + 3
+    if len(df_sorted) < required_length:
+        return "ERR_INSUFF_DATA"
+
+    current_trend_result = get_lasttrend_days(df_sorted)
+    if current_trend_result == 0:
+        return "ERR_NO_TREND"
+
+    current_trend_days = abs(current_trend_result)
+    current_trend_type = "Up" if current_trend_result > 0 else "Down"
+    if current_trend_days < min_current_trend_days:
+        return "ERR_CURR_DAYS"
+
+    prior_df = df_sorted.iloc[:-current_trend_days] if current_trend_days < len(df_sorted) else df_sorted.iloc[:0]
+    prior_trend_result = get_lasttrend_days(prior_df) if not prior_df.empty else 0
+    if prior_trend_result == 0:
+        return "ERR_NO_PRIOR_TREND"
+    prior_trend_days = abs(prior_trend_result)
+    prior_trend_type = "Up" if prior_trend_result > 0 else "Down"
+
+    if prior_trend_days < min_prior_trend_days:
+        return "ERR_PRIOR_DAYS"
+    if current_trend_days >= prior_trend_days:
+        return "ERR_CURR_GT_PRIOR"
+    if current_trend_type == prior_trend_type:
+        return "ERR_SAME_TRENDS"
+
+    base_code = f"{current_trend_type[0]}{current_trend_days}-{prior_trend_type[0]}{prior_trend_days}"
+    current_price = df_sorted['Close'].iloc[-1]
+
+    # Compute indicators robustly
+    ind_df = get_technical_indicators(df_sorted)
+
+    # Extract needed indicator values safely
+    cci_cur, cci_prev = _extract_indicator_value(ind_df.get('CCI') if 'CCI' in ind_df.columns else None, want_last=2)
+    rsi_cur, rsi_prev = _extract_indicator_value(ind_df.get('RSI') if 'RSI' in ind_df.columns else None, want_last=2)
+    macd_series = ind_df.get('MACDh_12_26_9') if 'MACDh_12_26_9' in ind_df.columns else None
+    macd_cur, macd_prev = _extract_indicator_value(macd_series, want_last=2)
+    adx_cur, adx_prev = _extract_indicator_value(ind_df.get('ADX') if 'ADX' in ind_df.columns else None, want_last=2)
+    obv_cur, obv_prev = _extract_indicator_value(ind_df.get('OBV') if 'OBV' in ind_df.columns else None, want_last=2)
+    atr_val = _extract_indicator_value(ind_df.get('ATR') if 'ATR' in ind_df.columns else None, want_last=1)
+    bbu = _extract_indicator_value(ind_df.get('BBU_20_2.0') if 'BBU_20_2.0' in ind_df.columns else ind_df.get('bb_upper', None), want_last=1)
+    bbl = _extract_indicator_value(ind_df.get('BBL_20_2.0') if 'BBL_20_2.0' in ind_df.columns else ind_df.get('bb_lower', None), want_last=1)
+
+    # If critical indicators are missing, return ERR_INDICATOR
+    critical_missing = any(pd.isna(x) for x in [cci_cur, cci_prev, rsi_cur, rsi_prev, macd_cur, macd_prev, adx_cur, adx_prev, obv_cur, obv_prev, atr_val])
+    if critical_missing:
+        # not fatal: return ERR_INDICATOR so caller knows we couldn't evaluate
+        return "ERR_INDICATOR"
+
+    # Build price-based references safely
+    year_slice = df_sorted['Close'].iloc[-252:] if len(df_sorted) >= 252 else df_sorted['Close']
+    price_data = {
+        'current': current_price,
+        'year_high': year_slice.max() if not year_slice.empty else current_price,
+        'year_low': year_slice.min() if not year_slice.empty else current_price,
+        'prior_high': df_sorted['Close'].iloc[-(current_trend_days + prior_trend_days):-current_trend_days].max() if (current_trend_days + prior_trend_days) <= len(df_sorted) else df_sorted['Close'].max(),
+        'prior_low': df_sorted['Close'].iloc[-(current_trend_days + prior_trend_days):-current_trend_days].min() if (current_trend_days + prior_trend_days) <= len(df_sorted) else df_sorted['Close'].min()
+    }
+
+    # Tests as robust boolean checks
+    tests: Dict[str, bool] = {}
+
+    # price bound
+    if current_trend_type == "Up" and prior_trend_type == "Down":
+        tests['price_bound'] = current_price >= price_data['year_low']
+    else:
+        tests['price_bound'] = current_price <= price_data['year_high']
+
+    # volatility move using ATR
+    try:
+        tests['volatility_move'] = (current_price - price_data['prior_low']) >= atr_multiplier * float(atr_val) if current_trend_type == "Up" else (price_data['prior_high'] - current_price) >= atr_multiplier * float(atr_val)
+    except Exception:
+        tests['volatility_move'] = False
+
+    # volume confidence
+    try:
+        tests['volume_conf'] = obv_cur > obv_prev if current_trend_type == "Up" else obv_cur < obv_prev
+    except Exception:
+        tests['volume_conf'] = False
+
+    # bollinger
+    try:
+        tests['bollinger'] = current_price > float(bbl) if current_trend_type == "Up" else current_price < float(bbu)
+    except Exception:
+        tests['bollinger'] = False
+
+    # stochastic check: best-effort if present
+    stoch_k = ind_df.get('STOCHk_14_3_3') if 'STOCHk_14_3_3' in ind_df.columns else None
+    stoch_d = ind_df.get('STOCHd_14_3_3') if 'STOCHd_14_3_3' in ind_df.columns else None
+    try:
+        if stoch_k is not None and stoch_d is not None:
+            k_cur, k_prev = _extract_indicator_value(stoch_k, want_last=2)
+            d_cur, d_prev = _extract_indicator_value(stoch_d, want_last=2)
+            if current_trend_type == "Up":
+                tests['stochastic'] = (k_cur > d_cur) and (k_cur < 20) and (d_cur < 20)
+            else:
+                tests['stochastic'] = (k_cur < d_cur) and (k_cur > 80) and (d_cur > 80)
+        else:
+            tests['stochastic'] = False
+    except Exception:
+        tests['stochastic'] = False
+
+    # direction-specific confirmations
+    if current_trend_type == "Up":
+        tests.update({
+            'cci': (cci_prev < -100 and cci_cur > -100),
+            'rsi': (rsi_prev < 30 and rsi_cur > rsi_prev),
+            'macd': (macd_prev < 0 and macd_cur > 0),
+            'sma_cross': False,  # cross check requires series-level checks; keep False for safety here
+            'adx': (adx_prev > adx_cur)  # simplistic check
+        })
+    else:
+        tests.update({
+            'cci': (cci_prev > 100 and cci_cur < 100),
+            'rsi': (rsi_prev > 70 and rsi_cur < rsi_prev),
+            'macd': (macd_prev > 0 and macd_cur < 0),
+            'sma_cross': False,
+            'adx': (adx_prev > adx_cur)
+        })
+
+    total_tests = len(tests)
+    confirmations = sum(1 for v in tests.values() if v)
+    ratio = confirmations / total_tests if total_tests > 0 else 0.0
+    if ratio >= 0.85:
+        conf_level = "STRONG"
+    elif ratio >= 0.65:
+        conf_level = "MOD"
+    else:
+        conf_level = "WEAK"
+
+    return f"{base_code}:{'BULL' if current_trend_type == 'Up' and prior_trend_type == 'Down' else 'BEAR'}-REVERSAL-{conf_level}_{confirmations}/{total_tests}"
+
+# -------------------------
+# Trend & MA helpers (reuse existing code but robust to NaNs)
+# -------------------------
+DEFAULT_INDICATORS_CONFIG = {
+    'ADX_Strong_threshold': 25,
+    'ADX_Average_threshold': 20,
+    'ADX_Weak_threshold': 15,
+    'BB_width_ranging_pct': 0.02,
+    'ATR_volatility_multiplier': 0.015,
+    'slope_window': 50,
+    'persistence_bars': 3,
+    'pullback_pct': 0.03,
+    'weights': {'ema_cross': 1.0, 'di': 1.0, 'adx': 1.0, 'slope': 0.5}
+}
+
+def compute_linear_slope(series: pd.Series, window: int) -> pd.Series:
+    def slope_calc(x):
+        if np.isnan(x).any():
+            return np.nan
+        y = x
+        x_idx = np.arange(len(y))
+        m, _, _, _, _ = stats.linregress(x_idx, y)
+        meanp = np.mean(y) if np.mean(y) != 0 else 1.0
+        return m / meanp
+    return series.rolling(window).apply(slope_calc, raw=True)
+
+def get_technicals(df: pd.DataFrame, config: dict) -> pd.DataFrame:
+    df = get_technical_indicators(df)
+    # DIWidth
+    if 'DIPLUS' in df.columns and 'DIMINUS' in df.columns:
+        df['DIWidth'] = (df['DIPLUS'] - df['DIMINUS']).abs()
+    else:
+        df['DIWidth'] = 0.0
+    df['DITrend'] = np.select(
+        [df.get('DIPLUS', 0) > df.get('DIMINUS', 0), df.get('DIPLUS', 0) == df.get('DIMINUS', 0), df.get('DIPLUS', 0) < df.get('DIMINUS', 0)],
+        ['Bull', 'Nil', 'Bear'],
+        default='Unknown'
+    )
+    df = get_ADX_Strength(df, config)
+    df = get_DI_Strength(df, config)
+    df = get_MA_Trend(df)
+    df = get_MADI_Trend(df)
+    df = get_primary_secondary_trends(df)
+    df = add_tma_single_crossover_flag(df, 'TMA_fast', 'TMA_slow', lookback=10, out_col='TMA21_50_X')
+    return df
+
+def get_MA_Trend(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df['EMA20_prev'] = df.get('EMA20', df['Close']).shift(1)
+    df['EMA50_prev'] = df.get('EMA50', df['Close']).shift(1)
+    df['Close_prev'] = df['Close'].shift(1)
+    df['Close_prev2'] = df['Close'].shift(2)
+    conditions = [
+        (df.get('EMA20', df['Close']) > df.get('EMA50', df['Close'])) &
+        (df.get('EMA20', df['Close']) > df['EMA20_prev']) &
+        (df.get('EMA50', df['Close']) > df['EMA50_prev']) &
+        (df['Close'] > df['Close_prev']) &
+        (df['Close_prev'] > df['Close_prev2']),
+        (df.get('EMA50', df['Close']) > df.get('EMA20', df['Close'])) &
+        (df.get('EMA20', df['Close']) <= df['EMA20_prev']) &
+        (df.get('EMA50', df['Close']) <= df['EMA50_prev']) &
+        (df['Close'] < df['Close_prev']) &
+        (df['Close_prev'] < df['Close_prev2']),
+        (df.get('EMA20', df['Close']) > df.get('EMA50', df['Close'])) &
+        (df.get('EMA20', df['Close']) > df['EMA20_prev']) &
+        (df.get('EMA50', df['Close']) > df['EMA50_prev']),
+        (df.get('EMA50', df['Close']) > df.get('EMA20', df['Close'])) &
+        (df.get('EMA20', df['Close']) <= df['EMA20_prev']) &
+        (df.get('EMA50', df['Close']) <= df['EMA50_prev'])
+    ]
+    choices = ['Bull+', 'Bear+', 'Bull', 'Bear']
+    df['MA_Trend'] = np.select(conditions, choices, default='Nil')
+    # drop temp cols
+    for c in ['EMA20_prev', 'EMA50_prev', 'Close_prev', 'Close_prev2']:
+        if c in df.columns:
+            df.drop(columns=[c], inplace=True)
+    return df
+
+def get_ADX_Strength(df: pd.DataFrame, config: dict) -> pd.DataFrame:
+    df = df.copy()
+    conditions = [
+        (df.get('ADX', 0) >= config['ADX_Strong_threshold']),
+        (df.get('ADX', 0) >= config['ADX_Average_threshold']),
+        (df.get('ADX', 0) < config['ADX_Average_threshold'])
+    ]
+    choices = ['Strong', 'Average', 'Weak']
+    df['ADX_Strength'] = np.select(conditions, choices, default='Weak')
+    return df
+
+def get_DI_Strength(df: pd.DataFrame, config: dict) -> pd.DataFrame:
+    df = df.copy()
+    conditions = [
+        (df.get('DIWidth', 0) >= config['DIWidth_Strong_threshold']),
+        (df.get('DIWidth', 0) >= config['DIWidth_Average_threshold']),
+        (df.get('DIWidth', 0) < config['DIWidth_Average_threshold'])
+    ]
+    choices = ['Strong', 'Average', 'Weak']
+    df['DI_Strength'] = np.select(conditions, choices, default='Weak')
+    return df
+
+def get_MADI_Trend(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    conditions = [
+        (df.get('EMA20', 0) > df.get('EMA50', 0)) & (df.get('DITrend', '') == 'Bull'),
+        (df.get('EMA50', 0) > df.get('EMA20', 0)) & (df.get('DITrend', '') == 'Bear')
+    ]
+    choices = ['Bull', 'Bear']
+    df['MADI_Trend'] = np.select(conditions, choices, default='Nil')
+    return df
+
+def add_tma_single_crossover_flag(df: pd.DataFrame, fast_col: str, slow_col: str, lookback: int, out_col: str) -> pd.DataFrame:
+    if df is None or df.empty or 'Close' not in df.columns:
+        if isinstance(df, pd.DataFrame):
+            df[out_col] = 0
+        return df
+    df = df.copy().reset_index(drop=True)
+    n = len(df)
+    last_idx = n - 1
+    lb = max(1, int(lookback) if lookback is not None else 1)
+    window_start = max(0, last_idx - lb + 1)
+
+    def _parse_len(col_name, default):
+        s = ''.join(ch for ch in str(col_name) if ch.isdigit())
+        try:
+            return int(s) if s else int(default)
+        except Exception:
+            return int(default)
+
+    fast_len = _parse_len(fast_col, 21)
+    slow_len = _parse_len(slow_col, 50)
+
+    def compute_tma(series: pd.Series, length: int) -> pd.Series:
+        k = max(1, (length + 1) // 2)
+        sma1 = series.rolling(window=k, min_periods=k).mean()
+        tma = sma1.rolling(window=k, min_periods=k).mean()
+        return tma
+
+    if fast_col not in df.columns:
+        df[fast_col] = compute_tma(df['Close'], fast_len)
+    if slow_col not in df.columns:
+        df[slow_col] = compute_tma(df['Close'], slow_len)
+
+    tma_fast = df[fast_col]
+    tma_slow = df[slow_col]
+    diff = tma_fast - tma_slow
+    cross_up = (diff > 0) & (diff.shift(1) <= 0)
+    cross_dn = (diff < 0) & (diff.shift(1) >= 0)
+    slope_fast = tma_fast.diff()
+    slope_slow = tma_slow.diff()
+    price = df['Close']
+    above_both = price >= pd.concat([tma_fast, tma_slow], axis=1).max(axis=1)
+    below_both = price <= pd.concat([tma_fast, tma_slow], axis=1).min(axis=1)
+    adx_ok = (df.get('ADX', 0) >= 20) if 'ADX' in df.columns else pd.Series(True, index=df.index)
+
+    bull_conf = cross_up & (slope_fast > 0) & (slope_slow >= 0) & above_both & adx_ok
+    bear_conf = cross_dn & (slope_fast < 0) & (slope_slow <= 0) & below_both & adx_ok
+
+    df[out_col] = 0
+    conf_idxs = np.where((bull_conf | bear_conf).to_numpy())[0]
+    if conf_idxs.size:
+        recent = conf_idxs[conf_idxs >= window_start]
+        if recent.size:
+            pos = int(recent.max())
+            df.at[last_idx, out_col] = 1 if bool(bull_conf.iloc[pos]) else -1
+
+    try:
+        df[out_col] = df[out_col].astype(np.int8)
+    except Exception:
+        pass
+    return df
+
+def get_primary_secondary_trends(df: pd.DataFrame, config: dict = DEFAULT_INDICATORS_CONFIG) -> pd.DataFrame:
+    df = df.copy()
+    C = config
+
+    df['feat_ema'] = np.where(df.get('EMA50', 0) > df.get('EMA200', 0), 1.0, -1.0)
+    df['feat_di'] = np.where(df.get('DITrend', '') == 'Bull', 1.0, np.where(df.get('DITrend', '') == 'Bear', -1.0, 0.0))
+    df['feat_adx'] = np.where(df.get('ADX', 0) >= C['ADX_Strong_threshold'], 1.0, np.where(df.get('ADX', 0) >= C['ADX_Average_threshold'], 0.5, 0.0))
+    slope = compute_linear_slope(df.get('EMA200', df['Close']).fillna(df['Close']), C['slope_window']).fillna(0.0)
+    df['feat_slope'] = np.sign(slope) * np.minimum(np.abs(slope) * 10, 1.0)
+
+    w = C['weights']
+    df['primary_score'] = (w['ema_cross'] * df['feat_ema'] +
+                           w['di'] * df['feat_di'] +
+                           w['adx'] * df['feat_adx'] +
+                           w['slope'] * df['feat_slope'])
+
+    df['Primary'] = 'Neutral'
+    df.loc[df['primary_score'] >= 1.0, 'Primary'] = 'Bull'
+    df.loc[df['primary_score'] <= -1.0, 'Primary'] = 'Bear'
+
+    is_low_adx = df.get('ADX', 0) < C['ADX_Average_threshold']
+    is_narrow_bb = df.get('BB_width', 1.0) < C['BB_width_ranging_pct']
+    is_volatile = (df.get('ATR', 0) / df.get('Close', 1)) > C['ATR_volatility_multiplier']
+
+    cross_up = (df.get('EMA20', 0) > df.get('EMA50', 0))
+    cross_down = (df.get('EMA20', 0) < df.get('EMA50', 0))
+
+    is_pullback_bull = (df['Primary'] == 'Bull') & (df.get('Close', 0) < df.get('EMA20', 0)) & (df.get('Close', 0) > df.get('EMA50', 0))
+    is_pullback_bear = (df['Primary'] == 'Bear') & (df.get('Close', 0) > df.get('EMA20', 0)) & (df.get('Close', 0) < df.get('EMA50', 0))
+
+    df['Secondary'] = 'Unknown'
+    df.loc[is_volatile, 'Secondary'] = 'Volatile'
+    df.loc[is_low_adx & is_narrow_bb & ~is_volatile, 'Secondary'] = 'Ranging'
+    df.loc[(~is_low_adx) & (df.get('ADX', 0) >= C['ADX_Strong_threshold']) & cross_up, 'Secondary'] = 'TrendingUp'
+    df.loc[(~is_low_adx) & (df.get('ADX', 0) >= C['ADX_Strong_threshold']) & cross_down, 'Secondary'] = 'TrendingDown'
+    df.loc[is_pullback_bull, 'Secondary'] = 'PullbackInBull'
+    df.loc[is_pullback_bear, 'Secondary'] = 'PullbackInBear'
+    df.loc[(df['Primary'] == 'Neutral') & (df.get('ADX', 0) >= C['ADX_Average_threshold']) & (cross_up | cross_down), 'Secondary'] = 'ShortTrend'
+
+    persistence = C['persistence_bars']
+
+    def majority_smooth(series, window):
+        result = pd.Series(index=series.index, dtype=object)
+        for i in range(len(series)):
+            start = max(0, i - window + 1)
+            window_data = series.iloc[start:i+1]
+            mode_vals = window_data.mode()
+            result.iloc[i] = mode_vals.iloc[0] if len(mode_vals) > 0 else window_data.iloc[-1]
+        return result
+
+    df['Primary_smoothed'] = majority_smooth(df['Primary'].astype(str), persistence)
+    df['Secondary_smoothed'] = majority_smooth(df['Secondary'].astype(str), persistence)
+    df['Trend'] = df['Primary_smoothed'].astype(str) + '[' + df['Secondary_smoothed'].astype(str) + ']'
+    df['Primary'] = df['Primary_smoothed'].astype('category')
+    df['Secondary'] = df['Secondary_smoothed'].astype('category')
+    df['ADX_Strength'] = df.get('ADX_Strength', pd.Series(['Weak'] * len(df))).astype('category')
+
+    for c in ['feat_ema', 'feat_di', 'feat_adx', 'feat_slope', 'primary_score', 'Primary_smoothed', 'Secondary_smoothed']:
+        if c in df.columns:
+            df.drop(columns=[c], inplace=True)
+    return df
+
+# -------------------------
+# DB helpers used by other scripts
+# -------------------------
+def get_symbols_forwatchlist(watchlist: str, config: dict) -> pd.DataFrame:
+    with getDbConnection() as conn:
+        query = text(f"SELECT DISTINCT symbol FROM {config['WATCHLIST_TABLENAME']} WHERE watchlist = :wl;")
+        df = pd.read_sql_query(query, con=conn, params={"wl": watchlist})
+    return df
+
+# -------------------------
+# Worker logic
+# -------------------------
+def get_tlib_tadata(underlying: str, price_source: str, my_logger, df: Optional[pd.DataFrame] = None, mainrun: bool = True) -> Optional[pd.DataFrame]:
+    printnlog(f"[get_tlib_tadata : {underlying}, {price_source}, df : {len(df) if df is not None else 'None'}, mainrun: {mainrun}]",
+              my_logger=my_logger)
+    config = initialize_config(price_source)
+    if df is None:
+        try:
+            df = config['CLOSING_PRICES_FUNCTION'](underlying)
+        except Exception as e:
+            my_logger.info(f'[get_tlib_tadata :: {config["CLOSING_PRICES_FUNCTION"].__name__} ERROR! - {e}\n {traceback.format_exc()}]')
+            return None
+    if df is None or df.empty:
+        my_logger.info(f"[get_tlib_tadata : Symbol {underlying}, Received Empty df]")
+        return None
+
+    # Normalize columns
+    df = df.rename(columns={c: c.title() for c in df.columns})
+    df.rename(columns={
+        'Open': 'Open', 'High': 'High', 'Low': 'Low', 'Close': 'Close',
+        'Volume': 'Volume', 'Date': 'Date', 'Symbol': 'Symbol'
+    }, inplace=True)
+
+    if 'Symbol' not in df.columns or df['Symbol'].isnull().all():
+        df['Symbol'] = underlying
+    df['Symbol'] = df['Symbol'].astype(str)
+
+    df = df.sort_values(['Date'], ascending=[True]).reset_index(drop=True)
+    history_bars = int(config.get('HISTORY_BARS', 600))
+    if history_bars > 0 and len(df) > history_bars:
+        df = df.tail(history_bars).reset_index(drop=True)
+
+    df = get_technicals(df, config)
+    result = {}
+    try:
+        result = config['LAST_PRICES_DETLS_FUNCTION'](underlying)
+    except Exception as e:
+        my_logger.info(f'[get_tlib_tadata :: {config["LAST_PRICES_DETLS_FUNCTION"].__name__} Error in getting last price details - {e}\n {traceback.format_exc()}]')
+
+    d = df.tail(1).copy()
+    d.drop([c for c in ['Unnamed', 'index', 'level_0'] if c in d.columns], axis=1, inplace=True)
+
+    # Fill fields from last price details safely
+    try:
+        d['TodayPrice'] = float(result.get('TodayPrice', d.get('Close', np.nan)))
+    except Exception:
+        d['TodayPrice'] = float(d.get('Close', np.nan) or np.nan)
+    d['marketCap'] = float(result.get('marketCap', 0.0) or 0.0)
+    d['GEM_Rank'] = str(result.get('GEM_Rank', '') or '')
+    d['CountryName'] = str(result.get('CountryName') or pd.NA)
+    d['IndustrySector'] = str(result.get('Sector', '') or '')
+    d['High52'] = float(result.get('High52', 0.0) or 0.0)
+    d['Low52'] = float(result.get('Low52', 0.0) or 0.0)
+    d['Pct2H52'] = float(result.get('Pct2H52', 0.0) or 0.0)
+    d['PctfL52'] = float(result.get('PctfL52', 0.0) or 0.0)
+
+    # RSIUturnTypeOld via TrendReversalDetector (best-effort)
+    try:
+        detector_old = TrendReversalDetector(df)
+        d['RSIUturnTypeOld'] = detector_old.signal()
+    except Exception:
+        d['RSIUturnTypeOld'] = pd.NA
+
+    # TrendReversal_Rules via detect_reversal_pro
+    try:
+        tr_label = detect_reversal_pro(df)
+        d['TrendReversal_Rules'] = tr_label
+    except Exception:
+        d['TrendReversal_Rules'] = pd.NA
+
+    # SignalClassifier_Rules & ML
+    sc = SignalClassifier()
+    try:
+        d['SignalClassifier_Rules'] = sc.get_rule_signal_int(df)
+    except Exception:
+        d['SignalClassifier_Rules'] = pd.NA
+    try:
+        d['SignalClassifier_ML'] = sc.get_ml_signal_int(df) if USE_ML else pd.NA
+    except Exception:
+        d['SignalClassifier_ML'] = pd.NA
+
+    # RSI uptrend + trend analysis
+    try:
+        is_uptrend, strength = detect_rsi_uptrend(df, oversold_threshold=35, min_slope_threshold=0.02, debug=False)
+        d['RSIUpTrend'] = is_uptrend
+    except Exception:
+        d['RSIUpTrend'] = False
+
+    try:
+        LastTrendDays, LastTrendType = get_lasttrend_days(df), None
+        d['LastTrendDays'] = LastTrendDays
+        d['LastTrendType'] = LastTrendType
+    except Exception:
+        d['LastTrendDays'] = 0
+        d['LastTrendType'] = pd.NA
+
+    # TrendReversal_ML (best-effort)
+    try:
+        d['TrendReversal_ML'] = detect_and_label_reversals(df) if USE_ML else pd.NA
+    except Exception:
+        d['TrendReversal_ML'] = pd.NA
+
+    d['ScanDate'] = strUtcNow()
+
+    # Ensure canonical columns present
+    canonical_cols = list(canonical_table_schema().keys())
+    for col in canonical_cols:
+        if col not in d.columns:
+            d[col] = None
+
+    try:
+        out = d[canonical_cols].reset_index(drop=True)
+    except Exception:
+        out = d.copy().reindex(columns=canonical_cols)
+    return out
+
+def process_symbol(symbol: str, price_source: str, my_logger_name: str) -> Tuple[str, Optional[pd.DataFrame], Optional[float], Optional[str]]:
+    my_logger = parallelLoggingSetter(my_logger_name)
+    start_time = time.time()
+    try:
+        df_row = get_tlib_tadata(underlying=symbol, price_source=price_source, my_logger=my_logger)
+        time_taken = round(time.time() - start_time, 4)
+        return (symbol, df_row, time_taken, None)
+    except Exception as e:
+        return (symbol, None, None, f"[get_tlib_tadata Error : {e}, \n {traceback.format_exc()}]")
+
+def worker_init(use_ml: bool):
+    global USE_ML
+    USE_ML = use_ml
+    try:
+        worker_logger = parallelLoggingSetter("worker_init")
+    except Exception:
+        worker_logger = logging.getLogger("worker_init")
+        if not worker_logger.handlers:
+            logging.basicConfig(level=logging.INFO)
+    worker_logger.info(f"[worker_init] INIT worker: USE_ML={USE_ML}")
+
+# -------------------------
+# Bulk insert helper
+# -------------------------
+def bulk_insert_dataframe(table_name: str, df: pd.DataFrame, chunksize: int = 500) -> None:
+    if df is None or df.empty:
+        return
+    fallback_logger = logging.getLogger("ta_signals_mc_parallel")
+    numeric_cols = ['Open', 'High', 'Low', 'Close', 'Volume', 'ADX', 'SMA200', 'EMA50', 'EMA20', 'CCI', 'RSI',
+                    'TodayPrice', 'marketCap', 'High52', 'Low52', 'Pct2H52', 'PctfL52', 'LastTrendDays',
+                    'SignalClassifier_Rules', 'SignalClassifier_ML']
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    if 'RSIUpTrend' in df.columns:
+        df['RSIUpTrend'] = df['RSIUpTrend'].astype(bool)
+    try:
+        with getDbConnection() as con:
+            try:
+                df.to_sql(table_name, con=con, index=False, if_exists='append', method='multi', chunksize=chunksize)
+            except TypeError:
+                df.to_sql(table_name, con=con, index=False, if_exists='append', chunksize=chunksize)
+            try:
+                if hasattr(con, 'commit') and callable(con.commit):
+                    con.commit()
+            except Exception:
+                pass
+    except Exception as e:
+        printnlog(f"[bulk_insert_dataframe] Error inserting into {table_name}: {e}\n{traceback.format_exc()}", my_logger=fallback_logger)
+        raise
+
+# -------------------------
+# Main CLI
+# -------------------------
+def main():
+    parser = argparse.ArgumentParser(description='Technical Analysis Signals Processor')
+    parser.add_argument('-w', '--watchlist', nargs='?', help='Watchlist name', required=True)
+    parser.add_argument('-s', '--source', nargs='?', help='Price source (FINNHUB/EOD/FINNHUB_LOCAL/EOD_LOCAL)', required=True)
+    parser.add_argument('--use_ml', choices=['yes', 'no'], default='yes', help='Whether to use ML scoring (default: yes).')
+    parser.add_argument('--max_workers', type=int, default=4, help='Max parallel workers')
+    args = parser.parse_args()
+
+    global USE_ML
+    USE_ML = str(args.use_ml).lower() == 'yes'
+    if not USE_ML:
+        printnlog("[INFO] ML scoring disabled via --use_ml=no.")
+
+    config = initialize_config(args.source)
+    WATCHLIST = args.watchlist.upper()
+    my_logger_name = f'ta_signals_mc_parallel_{WATCHLIST}'
+    my_logger = parallelLoggingSetter(my_logger_name)
+    printnlog(config, my_logger=my_logger)
+
+    countryName = get_country_name(WATCHLIST)
+    if countryName == "Invalid":
+        printnlog(f'\n[WATCHLIST = {WATCHLIST} not supported]', my_logger=my_logger)
+        sys.exit()
+
+    symbols_df = get_symbols_forwatchlist(WATCHLIST, config)
+    symbols = symbols_df['symbol'].tolist()
+    if not symbols:
+        printnlog(f"[get_symbols_forwatchlist: 0 Symbols found for {WATCHLIST}]", my_logger=my_logger)
+        sys.exit()
+    printnlog(f"[Count of total Symbols : {len(symbols)}]", my_logger=my_logger)
+
+    try:
+        ensure_output_table(config['tal_temp_tablename'], my_logger=my_logger)
+        ensure_output_table(config['tal_master_tablename'], my_logger=my_logger)
+        my_logger.info(f"[Ensured tables {config['tal_temp_tablename']} and {config['tal_master_tablename']}]")
+    except Exception as e:
+        my_logger.error(f"[Failed to ensure output tables: {e}\n{traceback.format_exc()}]")
+        sys.exit(1)
+
+    # Delete old temp rows safely using text and mapping
+    try:
+        printnlog('[Deleting outdated records from temporary table]', my_logger=my_logger)
+        delete_sql = text(f'DELETE FROM `{config["tal_temp_tablename"]}` WHERE `CountryName` = :country')
+        with getDbConnection() as con:
+            con.execute(delete_sql, {"country": countryName})
+            try:
+                if hasattr(con, 'commit') and callable(con.commit):
+                    con.commit()
+            except Exception:
+                pass
+            my_logger.info("[Delete operation completed successfully]")
+    except Exception as e:
+        my_logger.error(f"[Error during delete from {config['tal_temp_tablename']}: {e}\n {traceback.format_exc()}]")
+
+    # Parallel processing
+    rows: List[pd.DataFrame] = []
+    df_temp_all = pd.DataFrame()
+    i = 1
+    total_time = 0.0
+    with ProcessPoolExecutor(max_workers=args.max_workers, initializer=worker_init, initargs=(USE_ML,)) as executor:
+        futures = {executor.submit(process_symbol, symbol, config['PRICE_SOURCE'], my_logger_name): symbol for symbol in symbols}
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                sym, df_row, time_taken, error = future.result()
+                if error:
+                    my_logger.error(error)
+                else:
+                    if df_row is not None and isinstance(df_row, pd.DataFrame) and not df_row.empty:
+                        rows.append(df_row)
+                    total_time += time_taken or 0.0
+                    avg_time = round(total_time / i, 4) if i > 0 else 0
+                    remaining_time = round(avg_time * (len(symbols) - i), 4)
+                    log_str = f"[End Processing {symbol} - time taken {time_taken} seconds. Avg {avg_time}, time remaining {remaining_time}]"
+                    printnlog(log_str, my_logger=my_logger)
+                i += 1
+            except Exception as exc:
+                my_logger.error(f"[Parallel processing error for {symbol}: {exc}]")
+
+    # Bulk insert collected rows into temp and then master
+    if rows:
+        try:
+            df_temp_all = pd.concat(rows, ignore_index=True)
+            canonical_cols = list(canonical_table_schema().keys())
+            for c in canonical_cols:
+                if c not in df_temp_all.columns:
+                    df_temp_all[c] = None
+            df_temp_all = df_temp_all[canonical_cols]
+
+            # Fill missing CountryName
+            try:
+                mask = df_temp_all['CountryName'].isna() | (df_temp_all['CountryName'].astype(str).str.strip() == '')
+                filled_count = int(mask.sum())
+                if filled_count > 0:
+                    df_temp_all.loc[mask, 'CountryName'] = countryName
+                    my_logger.info(f"[CountryName fill] Filled {filled_count} rows in temp with CountryName='{countryName}'")
+            except Exception as e:
+                my_logger.warning(f"[CountryName fill] Error while filling CountryName: {e}")
+
+            # Symbol protection
+            try:
+                if 'Symbol' not in df_temp_all.columns:
+                    df_temp_all['Symbol'] = ''
+                mask_sym = df_temp_all['Symbol'].isna() | (df_temp_all['Symbol'].astype(str).str.strip() == '')
+                sym_filled = int(mask_sym.sum())
+                if sym_filled > 0:
+                    df_temp_all.loc[mask_sym, 'Symbol'] = ''
+                    my_logger.info(f"[Symbol check] Found {sym_filled} blank Symbol rows in temp payload")
+            except Exception as e:
+                my_logger.warning(f"[Symbol check] Error while checking/filling Symbol: {e}")
+
+            bulk_insert_dataframe(config['tal_temp_tablename'], df_temp_all, chunksize=500)
+            my_logger.info(f"[Inserted {len(df_temp_all)} rows into {config['tal_temp_tablename']}]")
+        except Exception as e:
+            my_logger.error(f"[Error inserting into temp table: {e}\n{traceback.format_exc()}]")
+    else:
+        my_logger.info('[No rows collected from workers; skipping temp insert]')
+
+    # Insert into master (delete then append) similarly to above (safe paramized queries)
+    if not df_temp_all.empty:
+        df_final = df_temp_all.copy()
+    else:
+        df_final = pd.DataFrame()
+
+    if not df_final.empty:
+        try:
+            with getDbConnection() as con:
+                sql_delete_master = text(f'DELETE FROM `{config["tal_master_tablename"]}` WHERE `CountryName` = :country')
+                con.execute(sql_delete_master, {"country": countryName})
+                try:
+                    if hasattr(con, 'commit') and callable(con.commit):
+                        con.commit()
+                except Exception:
+                    pass
+                my_logger.info(f"[Cleared rows from {config['tal_master_tablename']}]")
+        except Exception as e:
+            my_logger.error(f"[Deleting rows from {config['tal_master_tablename']}: Error -- {e} --\n {traceback.format_exc()}]")
+
+        try:
+            canonical_cols = list(canonical_table_schema().keys())
+            for c in canonical_cols:
+                if c not in df_final.columns:
+                    df_final[c] = None
+            df_final = df_final[canonical_cols]
+
+            try:
+                mask = df_final['CountryName'].isna() | (df_final['CountryName'].astype(str).str.strip() == '')
+                filled_count = int(mask.sum())
+                if filled_count > 0:
+                    df_final.loc[mask, 'CountryName'] = countryName
+                    my_logger.info(f"[CountryName fill] Filled {filled_count} rows in master payload with CountryName='{countryName}'")
+            except Exception as e:
+                my_logger.warning(f"[CountryName fill] Error while filling CountryName in master payload: {e}")
+
+            try:
+                if 'Symbol' not in df_final.columns:
+                    df_final['Symbol'] = ''
+                mask_sym = df_final['Symbol'].isna() | (df_final['Symbol'].astype(str).str.strip() == '')
+                sym_filled = int(mask_sym.sum())
+                if sym_filled > 0:
+                    df_final.loc[mask_sym, 'Symbol'] = ''
+                    my_logger.info(f"[Symbol fill] Filled {sym_filled} Symbol rows with empty-string before master insert")
+            except Exception as e:
+                my_logger.warning(f"[Symbol fill] Error while final-filling Symbol: {e}")
+
+            bulk_insert_dataframe(config['tal_master_tablename'], df_final, chunksize=500)
+            my_logger.info(f"[{len(df_final)} rows inserted into {config['tal_master_tablename']}]")
+        except Exception as e:
+            my_logger.error(f"[Insert into {config['tal_master_tablename']}: Error -- {e} --\n {traceback.format_exc()}]")
+    else:
+        my_logger.info('[Empty temp dataset or an error occurred; nothing to insert into master]')
+
+if __name__ == '__main__':
+    main()

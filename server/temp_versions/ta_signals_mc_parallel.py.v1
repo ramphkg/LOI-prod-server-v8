@@ -20,7 +20,28 @@ import logging
 
 import pandas_ta as pta  # optional usage in some functions
 from scipy import stats
-from sqlalchemy import text
+
+import traceback
+import warnings
+
+import traceback
+import warnings
+
+# Make pandas_ta optional (it has numpy 2.x compatibility issues)
+pta = None
+try:
+    import pandas_ta as pta
+except ImportError as e:
+    warnings.warn(
+        f"pandas_ta import failed (numpy compatibility issue). "
+        f"Continuing without pandas_ta.\nError: {e}",
+        ImportWarning
+    )
+except Exception as e:
+    warnings.warn(
+        f"pandas_ta import failed unexpectedly: {e}",
+        ImportWarning
+    )
 
 # Local application imports - expected to be present in your environment
 from app_imports import getDbConnection, parallelLoggingSetter, printnlog, strUtcNow
@@ -129,15 +150,15 @@ def ensure_output_table(table_name: str, my_logger=None) -> None:
 
             # Ensure each column exists
             for col, ctype in schema.items():
-                q_check = text("""
+                q_check = """
                     SELECT DATA_TYPE, CHARACTER_MAXIMUM_LENGTH
                     FROM INFORMATION_SCHEMA.COLUMNS
-                    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :table_name AND COLUMN_NAME = :col
-                """)
+                    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s
+                """
                 data_type = None
                 char_max = None
                 try:
-                    res = con.execute(q_check, {"table_name": table_name, "col": col})
+                    res = con.execute(q_check, [table_name, col])
                     row = res.fetchone()
                     if row:
                         data_type = row[0]
@@ -177,12 +198,12 @@ def ensure_output_table(table_name: str, my_logger=None) -> None:
                 f'idx_{table_name}_date': ('Date',)
             }
             for idx_name, cols in idx_defs.items():
-                q_idx_check = text("""
+                q_idx_check = """
                     SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS
-                    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :table_name AND INDEX_NAME = :idx_name
-                """)
+                    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND INDEX_NAME = %s
+                """
                 try:
-                    res = con.execute(q_idx_check, {"table_name": table_name, "idx_name": idx_name})
+                    res = con.execute(q_idx_check, [table_name, idx_name])
                     r = res.fetchone()
                     idx_cnt = int(r[0]) if r is not None else 0
                 except Exception:
@@ -191,11 +212,11 @@ def ensure_output_table(table_name: str, my_logger=None) -> None:
                 if idx_cnt == 0:
                     col = cols[0]
                     try:
-                        res = con.execute(text("""
+                        res = con.execute("""
                             SELECT DATA_TYPE, CHARACTER_MAXIMUM_LENGTH
                             FROM INFORMATION_SCHEMA.COLUMNS
-                            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :table_name AND COLUMN_NAME = :col
-                        """), {"table_name": table_name, "col": col})
+                            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s
+                        """, [table_name, col])
                         meta = res.fetchone()
                         data_type = meta[0] if meta is not None else None
                         char_max = meta[1] if meta is not None else None
@@ -232,24 +253,24 @@ def ensure_output_table(table_name: str, my_logger=None) -> None:
 # -------------------------
 def get_historic_prices_from_finnhub_local(symbol: str) -> pd.DataFrame:
     with getDbConnection() as con:
-        q = text("""
+        q = """
         SELECT symbol, date AS Date, open AS Open, high AS High, low AS Low, close AS Close, volume AS Volume
         FROM finnhub_stock_prices
-        WHERE symbol = :symbol
+        WHERE symbol = %s
         ORDER BY date ASC
-        """)
-        df = pd.read_sql(q, con=con, params={"symbol": symbol})
+        """
+        df = pd.read_sql(q, con=con, params=[symbol])
     return df
 
 def get_historic_prices_from_eod_local(symbol: str) -> pd.DataFrame:
     with getDbConnection() as con:
-        q = text("""
+        q = """
         SELECT symbol, date AS Date, open AS Open, high AS High, low AS Low, close AS Close, volume AS Volume
         FROM eod_stock_prices
-        WHERE symbol = :symbol
+        WHERE symbol = %s
         ORDER BY date ASC
-        """)
-        df = pd.read_sql(q, con=con, params={"symbol": symbol})
+        """
+        df = pd.read_sql(q, con=con, params=[symbol])
     return df
 
 # -------------------------
@@ -785,7 +806,7 @@ def get_ADX_Strength(df: pd.DataFrame, config: dict) -> pd.DataFrame:
         (df['ADX'] < config['ADX_Average_threshold'])
     ]
     choices = ['Strong', 'Average', 'Weak']
-    df['ADX_Strength'] = np.select(conditions, choices, default='Unknown')
+    df['ADX_Strength'] = np.select(conditions, choices)
     return df
 
 def get_DI_Strength(df: pd.DataFrame, config: dict) -> pd.DataFrame:
@@ -795,7 +816,7 @@ def get_DI_Strength(df: pd.DataFrame, config: dict) -> pd.DataFrame:
         (df['DIWidth'] < config['DIWidth_Average_threshold'])
     ]
     choices = ['Strong', 'Average', 'Weak']
-    df['DI_Strength'] = np.select(conditions, choices, default='Unknown')
+    df['DI_Strength'] = np.select(conditions, choices)
     return df
 
 def get_MADI_Trend(df: pd.DataFrame) -> pd.DataFrame:
@@ -885,8 +906,8 @@ def get_technicals(df: pd.DataFrame, config: dict) -> pd.DataFrame:
 
 def get_symbols_forwatchlist(watchlist: str, config: dict) -> pd.DataFrame:
     with getDbConnection() as conn:
-        query = text(f"SELECT DISTINCT symbol FROM {config['WATCHLIST_TABLENAME']} WHERE watchlist = :watchlist;")
-        df = pd.read_sql(query, con=conn, params={"watchlist": watchlist})
+        query = f"SELECT DISTINCT symbol FROM {config['WATCHLIST_TABLENAME']} WHERE watchlist = %s;"
+        df = pd.read_sql(query, con=conn, params=[watchlist])
     return df
 
 # -------------------------
@@ -1127,9 +1148,9 @@ def main():
     # Delete old temp rows for this country
     try:
         printnlog('[Deleting outdated records from temporary table]', my_logger=my_logger)
-        delete_sql = text(f'DELETE FROM `{config["tal_temp_tablename"]}` WHERE `CountryName` = :country')
+        delete_sql = f'DELETE FROM `{config["tal_temp_tablename"]}` WHERE `CountryName` = %s'
         with getDbConnection() as con:
-            con.execute(delete_sql, {"country": countryName})
+            con.execute(delete_sql, [countryName])
             try:
                 if hasattr(con, 'commit') and callable(con.commit):
                     con.commit()
@@ -1212,8 +1233,8 @@ def main():
     if not df_final.empty:
         try:
             with getDbConnection() as con:
-                sql_delete_master = text(f'DELETE FROM `{config["tal_master_tablename"]}` WHERE `CountryName` = :country')
-                result = con.execute(sql_delete_master, {"country": countryName})
+                sql_delete_master = f'DELETE FROM `{config["tal_master_tablename"]}` WHERE `CountryName` = %s'
+                result = con.execute(sql_delete_master, [countryName])
                 try:
                     if hasattr(con, 'commit') and callable(con.commit):
                         con.commit()
