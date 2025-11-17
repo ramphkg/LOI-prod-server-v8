@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# tas_swing_scoring_csv.py
+# tas_swing_scoring.py
 #
 # Purpose:
 #   - Load latest tas_listings snapshot (by CountryName) from DB.
@@ -8,7 +8,7 @@
 #   - Export full snapshot with SwingScore and top-N long/short shortlists as CSV files to ../data.
 #
 # Usage:
-#   python tas_swing_scoring_csv.py --watchlist US_CORE --source FINNHUB --top_n 25 --use_ml_preferred yes --update_db no --out_dir ../data
+#   python tas_swing_scoring.py --watchlist US_CORE --source FINNHUB --top_n 25 --use_ml_preferred yes --update_db no --out_dir ../data
 #
 # Assumptions:
 #   - DB connection helper app_imports.getDbConnection is available.
@@ -47,10 +47,17 @@ REVERSAL_MAP = {
     "NoReversal": 0,
     "BullishReversalWeak": +1,
     "BullishReversalModerate": +2,
+    "BullishReversalStrong": +3,
     "BearishReversalWeak": -1,
     "BearishReversalModerate": -2,
-    "BearishReversalStrong": -3
-    # If "BullishReversalStrong" appears later, map to +3 symmetrically.
+    "BearishReversalStrong": -3,
+    # TrendReversal_ML uses different naming convention
+    "BullishReversal-MLWeak": +1,
+    "BullishReversal-MLModerate": +2,
+    "BullishReversal-MLStrong": +3,
+    "BearishReversal-MLWeak": -1,
+    "BearishReversal-MLModerate": -2,
+    "BearishReversal-MLStrong": -3
 }
 
 DEFAULT_WEIGHTS = {
@@ -63,6 +70,7 @@ DEFAULT_WEIGHTS = {
     "adx": 0.05,
     "reversal_rules": 0.08,
     "reversal_ml": 0.08,
+    "rsi_uturn_old": 0.06,  # legacy RSIUturnTypeOld directional confirmation
     "late_trend_penalty": -0.05,
     "near_52w_high_penalty": -0.05,
     "near_52w_low_bonus": 0.05
@@ -96,6 +104,28 @@ def parse_trend(trend: object) -> tuple[str, str]:
         secondary = t.split("[", 1)[1][:-1]
         return (primary or "Neutral", secondary or "Unknown")
     return (t if t else "Neutral", "Unknown")
+
+def parse_rsi_uturn_old(label: object) -> float:
+    """Map legacy RSIUturnTypeOld string to a normalized directional value in [-1,+1].
+    Accepted patterns observed:
+      - ERR_NO_TREND, ERR_INSUFF_DATA -> 0
+      - BullishReversal[Weak|Moderate|Strong]
+      - BearishReversal[Weak|Moderate|Strong]
+    Strength scaling: Weak=0.4, Moderate=0.7, Strong=1.0
+    """
+    if label is None:
+        return 0.0
+    s = str(label).strip()
+    if not s or s.startswith("ERR"):
+        return 0.0
+    if "BullishReversal" in s:
+        strength = 1.0 if "Strong" in s else 0.7 if "Moderate" in s else 0.4 if "Weak" in s else 0.0
+        return strength
+    if "BearishReversal" in s:
+        strength = 1.0 if "Strong" in s else 0.7 if "Moderate" in s else 0.4 if "Weak" in s else 0.0
+        return -strength
+    # Unknown pattern
+    return 0.0
 
 def swing_score(row: pd.Series, weights: dict | None = None) -> float:
     """
@@ -145,6 +175,12 @@ def swing_score(row: pd.Series, weights: dict | None = None) -> float:
         sec_boost = -1.0
     elif secondary == "TrendingDown":
         sec_boost = -0.8
+    elif secondary == "Volatile":
+        sec_boost = 0.0  # Neutral - no clear directional bias
+    elif secondary == "ShortTrend":
+        sec_boost = 0.3 if primary == "Bull" else -0.3 if primary == "Bear" else 0.0
+    elif secondary == "Ranging":
+        sec_boost = 0.0  # Neutral - sideways movement
     score += W["trend_secondary"] * sec_boost
 
     # 3) TMA cross
@@ -183,6 +219,14 @@ def swing_score(row: pd.Series, weights: dict | None = None) -> float:
     if rr_ml != 0:
         score += W["reversal_ml"] * (rr_ml / 3.0)
 
+    # 6b) Legacy RSIUturnTypeOld directional confirmation (optional)
+    try:
+        uturn_val = parse_rsi_uturn_old(row.get("RSIUturnTypeOld"))
+    except Exception:
+        uturn_val = 0.0
+    if uturn_val != 0.0:
+        score += W["rsi_uturn_old"] * uturn_val
+
     # 7) Late leg penalty
     try:
         ltd = float(row.get("LastTrendDays") or 0.0)
@@ -205,7 +249,8 @@ def swing_score(row: pd.Series, weights: dict | None = None) -> float:
     if pfl <= 5.0 and (primary == "Bull" or rsi_up):
         score += W["near_52w_low_bonus"]
 
-    return float(score)
+    # Scale to 0-100 range for readability (preserves ordering)
+    return int(round(score * 100))
 
 # --------------------------
 # DB helpers (optional update)
@@ -287,43 +332,129 @@ def upsert_temp_scores_table(temp_table: str, df_scores: pd.DataFrame, logger) -
         logger.info(f"[upsert_temp_scores_table] Inserted {len(df_scores)} rows into {temp_table}")
 
 # --------------------------
-# CSV writers
+# DB table management for tas_swing_listings
 # --------------------------
-def write_csv(df_full: pd.DataFrame, df_longs: pd.DataFrame, df_shorts: pd.DataFrame,
-              out_dir: str, master_table: str, country: str, logger) -> tuple[str, str, str]:
-    ensure_dir(out_dir)
-    stamp = utc_datestr()
-    full_path = os.path.join(out_dir, f"swingscores_{master_table}_{country}_{stamp}.csv")
-    longs_path = os.path.join(out_dir, f"shortlist_longs_{master_table}_{country}_{stamp}.csv")
-    shorts_path = os.path.join(out_dir, f"shortlist_shorts_{master_table}_{country}_{stamp}.csv")
-
-    # Avoid timezone-aware datetimes in CSV by converting to ISO dates/strings
-    df_full_exp = df_full.copy()
-    if 'Date' in df_full_exp.columns:
+def ensure_swing_table(table_name: str, logger) -> None:
+    """Ensure tas_swing_listings table exists with necessary schema."""
+    with getDbConnection() as con:
+        # Check if table exists
         try:
-            df_full_exp['Date'] = pd.to_datetime(df_full_exp['Date']).dt.date
+            q = text("""
+                SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :t
+            """)
+            r = con.execute(q, {"t": table_name}).fetchone()
+            exists = bool(r and int(r[0]) > 0)
+        except Exception as e:
+            logger.warning(f"[ensure_swing_table] INFO_SCHEMA check failed: {e}; attempting CREATE")
+            exists = False
+
+        if not exists:
+            create_sql = text(f"""
+                CREATE TABLE `{table_name}` (
+                    `Date` DATE,
+                    `Symbol` VARCHAR(191),
+                    `CountryName` VARCHAR(191),
+                    `SwingScore` DOUBLE,
+                    `Direction` VARCHAR(16),
+                    `Trend` VARCHAR(64),
+                    `SignalClassifier_ML` INTEGER,
+                    `SignalClassifier_Rules` INTEGER,
+                    `TMA21_50_X` SMALLINT,
+                    `RSIUpTrend` BOOLEAN,
+                    `ADX` DOUBLE,
+                    `Pct2H52` DOUBLE,
+                    `PctfL52` DOUBLE,
+                    `GEM_Rank` VARCHAR(32),
+                    `marketCap` DOUBLE,
+                    `IndustrySector` VARCHAR(64),
+                    `ScanDate` TIMESTAMP,
+                    INDEX idx_symbol (Symbol),
+                    INDEX idx_country (CountryName),
+                    INDEX idx_date (Date)
+                ) ENGINE=InnoDB
+            """)
+            try:
+                con.execute(create_sql)
+                logger.info(f"[ensure_swing_table] Created table {table_name}")
+            except Exception as e:
+                logger.error(f"[ensure_swing_table] Failed to create {table_name}: {e}")
+                raise
+
+def purge_country_swing_records(table_name: str, country: str, logger) -> int:
+    """Delete existing swing records for given country."""
+    with getDbConnection() as con:
+        sql = text(f"DELETE FROM `{table_name}` WHERE CountryName = :country")
+        res = con.execute(sql, {"country": country})
+        try:
+            if hasattr(con, 'commit') and callable(con.commit):
+                con.commit()
+        except Exception:
+            pass
+        rowcount = getattr(res, "rowcount", 0)
+        logger.info(f"[purge_country_swing_records] Deleted {rowcount} rows for {country}")
+        return int(rowcount)
+
+def insert_swing_scores(table_name: str, df_full: pd.DataFrame, country: str, logger) -> None:
+    """Bulk insert swing scores with Direction labels into tas_swing_listings."""
+    if df_full.empty:
+        logger.warning(f"[insert_swing_scores] No data to insert for {country}")
+        return
+
+    # Prepare columns for insert
+    cols = ['Date', 'Symbol', 'CountryName', 'SwingScore', 'Direction', 'Trend',
+            'SignalClassifier_ML', 'SignalClassifier_Rules', 'TMA21_50_X', 'RSIUpTrend',
+            'ADX', 'Pct2H52', 'PctfL52', 'GEM_Rank', 'marketCap', 'IndustrySector', 'ScanDate']
+
+    df_insert = df_full.copy()
+    # Add Direction column based on SwingScore
+    df_insert['Direction'] = df_insert['SwingScore'].apply(
+        lambda x: 'Long' if pd.notna(x) and x > 0 else 'Short' if pd.notna(x) and x < 0 else 'Neutral'
+    )
+
+    # Ensure all required columns exist
+    for col in cols:
+        if col not in df_insert.columns:
+            df_insert[col] = None
+
+    df_insert = df_insert[cols]
+
+    # Convert Date to proper format
+    if 'Date' in df_insert.columns:
+        try:
+            df_insert['Date'] = pd.to_datetime(df_insert['Date']).dt.date
         except Exception:
             pass
 
-    df_full_exp.to_csv(full_path, index=False)
-    df_longs.to_csv(longs_path, index=False)
-    df_shorts.to_csv(shorts_path, index=False)
-    logger.info(f"[write_csv] Wrote:\n  {full_path}\n  {longs_path}\n  {shorts_path}")
-    return full_path, longs_path, shorts_path
+    with getDbConnection() as con:
+        try:
+            df_insert.to_sql(table_name, con=con, index=False, if_exists='append', method='multi', chunksize=500)
+        except TypeError:
+            df_insert.to_sql(table_name, con=con, index=False, if_exists='append', chunksize=500)
+        except Exception as e:
+            logger.error(f"[insert_swing_scores] Insert failed: {e}")
+            raise
+        try:
+            if hasattr(con, 'commit') and callable(con.commit):
+                con.commit()
+        except Exception:
+            pass
+    logger.info(f"[insert_swing_scores] Inserted {len(df_insert)} rows into {table_name} for {country}")
 
 # --------------------------
 # Main job
 # --------------------------
 def run_job(watchlist: str, price_source: str, top_n: int, use_ml_preferred: bool,
             update_db: bool, out_dir: str):
-    logger = logging.getLogger("tas_swing_scoring_csv")
+    logger = logging.getLogger("tas_swing_scoring")
     logger.info(f"[run_job] watchlist={watchlist}, source={price_source}, top_n={top_n}, use_ml_preferred={use_ml_preferred}, update_db={update_db}, out_dir={out_dir}")
 
     # Resolve tables and CountryName via the TA pipeline config [[11]]
     cfg = initialize_config(price_source)  # [[11]]
     master_table = cfg["tal_master_tablename"]  # [[11]]
     country = get_country_name(watchlist)       # [[11]]
-    logger.info(f"[run_job] master={master_table}, country={country}")
+    swing_table = "tas_swing_listings"
+    logger.info(f"[run_job] master={master_table}, country={country}, swing_table={swing_table}")
 
     # Load latest snapshot rows for CountryName
     with getDbConnection() as con:
@@ -344,7 +475,7 @@ def run_job(watchlist: str, price_source: str, top_n: int, use_ml_preferred: boo
     # Compute SwingScore
     df["SwingScore"] = df.apply(swing_score, axis=1)
 
-    # Optional DB update
+    # Optional DB update to master table
     if update_db:
         try:
             ensure_score_column(master_table, logger)
@@ -354,26 +485,34 @@ def run_job(watchlist: str, price_source: str, top_n: int, use_ml_preferred: boo
         except Exception as e:
             logger.error(f"[run_job] DB update failed: {e}")
 
-    # Build top-N longs and shorts DataFrames
+    # Write all scored records to tas_swing_listings (purge country first)
+    try:
+        ensure_swing_table(swing_table, logger)
+        purge_country_swing_records(swing_table, country, logger)
+        insert_swing_scores(swing_table, df, country, logger)
+    except Exception as e:
+        logger.error(f"[run_job] Failed to write to {swing_table}: {e}")
+
+    # Build top-N longs and shorts DataFrames for logging/display
     df_nonnull = df[df["SwingScore"].notna()].copy()
-    df_longs = (df_nonnull.sort_values("SwingScore", ascending=False)
+    df_longs = (df_nonnull[df_nonnull["SwingScore"] > 0]
+                        .sort_values("SwingScore", ascending=False)
                         .head(top_n)
                         [["Date", "Symbol", "CountryName", "SwingScore", "SignalClassifier_ML",
                           "SignalClassifier_Rules", "Trend", "TMA21_50_X", "RSIUpTrend", "ADX",
                           "Pct2H52", "PctfL52", "GEM_Rank", "marketCap", "IndustrySector", "ScanDate"]]
                         .reset_index(drop=True))
-    df_longs.insert(3, "Direction", "Long")
 
-    df_shorts = (df_nonnull.sort_values("SwingScore", ascending=True)
+    df_shorts = (df_nonnull[df_nonnull["SwingScore"] < 0]
+                         .sort_values("SwingScore", ascending=True)
                          .head(top_n)
                          [["Date", "Symbol", "CountryName", "SwingScore", "SignalClassifier_ML",
                            "SignalClassifier_Rules", "Trend", "TMA21_50_X", "RSIUpTrend", "ADX",
                            "Pct2H52", "PctfL52", "GEM_Rank", "marketCap", "IndustrySector", "ScanDate"]]
                          .reset_index(drop=True))
-    df_shorts.insert(3, "Direction", "Short")
 
-    # Export CSVs
-    write_csv(df, df_longs, df_shorts, out_dir, master_table, country, logger)
+    logger.info(f"[run_job] Computed {len(df_longs)} long candidates and {len(df_shorts)} short candidates (top {top_n})")
+    logger.info(f"[run_job] All scored records written to {swing_table} for country={country}")
 
 def main():
     ap = argparse.ArgumentParser(description="Compute SwingScore and export shortlist CSVs")
@@ -405,7 +544,7 @@ def main():
             out_dir=args.out_dir
         )
     except Exception as e:
-        logging.getLogger("tas_swing_scoring_csv").error(f"[FATAL] {e}\n{traceback.format_exc()}")
+        logging.getLogger("tas_swing_scoring").error(f"[FATAL] {e}\n{traceback.format_exc()}")
         sys.exit(1)
 
 if __name__ == "__main__":
