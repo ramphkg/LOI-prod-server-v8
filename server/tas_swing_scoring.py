@@ -354,10 +354,15 @@ def ensure_swing_table(table_name: str, logger) -> None:
                 CREATE TABLE `{table_name}` (
                     `Date` DATE,
                     `Symbol` VARCHAR(191),
+                    `TodayPrice` DOUBLE,
                     `CountryName` VARCHAR(191),
                     `SwingScore` DOUBLE,
                     `Direction` VARCHAR(16),
                     `Trend` VARCHAR(64),
+                    `RSIUturnTypeOld` VARCHAR(191),
+                    `TrendReversal_Rules` VARCHAR(191),
+                    `TrendReversal_ML` VARCHAR(191),
+                    `LastTrendDays` INTEGER,
                     `SignalClassifier_ML` INTEGER,
                     `SignalClassifier_Rules` INTEGER,
                     `TMA21_50_X` SMALLINT,
@@ -402,9 +407,14 @@ def insert_swing_scores(table_name: str, df_full: pd.DataFrame, country: str, lo
         return
 
     # Prepare columns for insert
-    cols = ['Date', 'Symbol', 'CountryName', 'SwingScore', 'Direction', 'Trend',
-            'SignalClassifier_ML', 'SignalClassifier_Rules', 'TMA21_50_X', 'RSIUpTrend',
-            'ADX', 'Pct2H52', 'PctfL52', 'GEM_Rank', 'marketCap', 'IndustrySector', 'ScanDate']
+    # Include newly added schema fields so they are persisted downstream:
+    # TodayPrice, RSIUturnTypeOld, TrendReversal_Rules, TrendReversal_ML, LastTrendDays
+    cols = [
+        'Date', 'Symbol', 'CountryName', 'TodayPrice', 'SwingScore', 'Direction', 'Trend',
+        'RSIUturnTypeOld', 'TrendReversal_Rules', 'TrendReversal_ML', 'LastTrendDays',
+        'SignalClassifier_ML', 'SignalClassifier_Rules', 'TMA21_50_X', 'RSIUpTrend',
+        'ADX', 'Pct2H52', 'PctfL52', 'GEM_Rank', 'marketCap', 'IndustrySector', 'ScanDate'
+    ]
 
     df_insert = df_full.copy()
     # Add Direction column based on SwingScore
@@ -498,17 +508,19 @@ def run_job(watchlist: str, price_source: str, top_n: int, use_ml_preferred: boo
     df_longs = (df_nonnull[df_nonnull["SwingScore"] > 0]
                         .sort_values("SwingScore", ascending=False)
                         .head(top_n)
-                        [["Date", "Symbol", "CountryName", "SwingScore", "SignalClassifier_ML",
-                          "SignalClassifier_Rules", "Trend", "TMA21_50_X", "RSIUpTrend", "ADX",
-                          "Pct2H52", "PctfL52", "GEM_Rank", "marketCap", "IndustrySector", "ScanDate"]]
+                                                [["Date", "Symbol", "CountryName", "TodayPrice", "SwingScore", "SignalClassifier_ML",
+                                                    "SignalClassifier_Rules", "Trend", "RSIUturnTypeOld", "TrendReversal_Rules", "TrendReversal_ML",
+                                                    "LastTrendDays", "TMA21_50_X", "RSIUpTrend", "ADX",
+                                                    "Pct2H52", "PctfL52", "GEM_Rank", "marketCap", "IndustrySector", "ScanDate"]]
                         .reset_index(drop=True))
 
     df_shorts = (df_nonnull[df_nonnull["SwingScore"] < 0]
                          .sort_values("SwingScore", ascending=True)
                          .head(top_n)
-                         [["Date", "Symbol", "CountryName", "SwingScore", "SignalClassifier_ML",
-                           "SignalClassifier_Rules", "Trend", "TMA21_50_X", "RSIUpTrend", "ADX",
-                           "Pct2H52", "PctfL52", "GEM_Rank", "marketCap", "IndustrySector", "ScanDate"]]
+                                                 [["Date", "Symbol", "CountryName", "TodayPrice", "SwingScore", "SignalClassifier_ML",
+                                                     "SignalClassifier_Rules", "Trend", "RSIUturnTypeOld", "TrendReversal_Rules", "TrendReversal_ML",
+                                                     "LastTrendDays", "TMA21_50_X", "RSIUpTrend", "ADX",
+                                                     "Pct2H52", "PctfL52", "GEM_Rank", "marketCap", "IndustrySector", "ScanDate"]]
                          .reset_index(drop=True))
 
     logger.info(f"[run_job] Computed {len(df_longs)} long candidates and {len(df_shorts)} short candidates (top {top_n})")
