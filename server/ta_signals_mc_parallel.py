@@ -29,9 +29,8 @@ from finnhub_api_prices import finnhub_lastPriceDetails, get_historic_prices_fro
 
 from SignalClassifier import SignalClassifier
 from TrendReversalDetector import TrendReversalDetector
-# TrendReversalDetectorML removed
 from TrendReversalDetectorFunction import detect_reversal_pro
-from TrendReversalDetectorML import detect_and_label_reversals
+from ML_Predict_Price import predict_best_horizon
 
 # Shared indicators utility
 from indicators import compute_indicators
@@ -76,14 +75,17 @@ def canonical_table_schema() -> dict:
         "PctfL52": "DOUBLE PRECISION",
         "RSIUturnTypeOld": "VARCHAR(64)",
         "TrendReversal_Rules": "VARCHAR(64)",
-        "TrendReversal_ML": "VARCHAR(64)",
         "RSIUpTrend": "BOOLEAN",
         "LastTrendDays": "INTEGER",
         "LastTrendType": "VARCHAR(32)",
         "Trend": "VARCHAR(64)",
         "ScanDate": "TIMESTAMP",
         "SignalClassifier_Rules": "INTEGER",
-        "SignalClassifier_ML": "INTEGER"
+        "SignalClassifier_ML": "INTEGER",
+        "ML_Target_Price": "DOUBLE PRECISION",
+        "ML_Target_Price_Days": "INTEGER",
+        "ML_Confidence_Score": "DOUBLE PRECISION",
+        "ML_Target_Return_Pct": "DOUBLE PRECISION"
     }
 
 # -------------------------
@@ -122,7 +124,7 @@ def ensure_output_table(table_name: str, my_logger=None) -> None:
             col_defs = [f'`{col}` {_sql_type_for_mysql(ctype)}' for col, ctype in schema.items()]
             create_sql = f'CREATE TABLE IF NOT EXISTS {q_table} ({", ".join(col_defs)}) ENGINE=InnoDB;'
             try:
-                con.execute(create_sql)
+                con.execute(text(create_sql))
                 my_logger.info(f"[ensure_output_table] CREATE TABLE IF NOT EXISTS executed for {table_name}")
             except Exception as e:
                 my_logger.warning(f"[ensure_output_table] CREATE TABLE issued with warning: {e}")
@@ -150,7 +152,7 @@ def ensure_output_table(table_name: str, my_logger=None) -> None:
                             FROM INFORMATION_SCHEMA.COLUMNS
                             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{table_name}' AND COLUMN_NAME = '{col}'
                         """
-                        res = con.execute(inline)
+                        res = con.execute(text(inline))
                         row = res.fetchone()
                         if row:
                             data_type = row[0]
@@ -162,7 +164,7 @@ def ensure_output_table(table_name: str, my_logger=None) -> None:
                 if data_type is None:
                     add_sql = f'ALTER TABLE {q_table} ADD COLUMN `{col}` {_sql_type_for_mysql(ctype)};'
                     try:
-                        con.execute(add_sql)
+                        con.execute(text(add_sql))
                         my_logger.info(f"[ensure_output_table] Added missing column `{col}` to {table_name}")
                     except Exception as e:
                         my_logger.error(f"[ensure_output_table] Failed to add column `{col}` to {table_name}: {e}\nSQL: {add_sql}")
@@ -994,17 +996,33 @@ def get_tlib_tadata(underlying: str, price_source: str, my_logger, df: Optional[
         my_logger.info(f"get_tlib_tadata : Symbol {underlying}, ERROR! in Determining Trend - {e}\n {traceback.format_exc()}")
         return None
     """
-    # TrendReversal_ML
-    ml_signal = pd.NA
+
+    # ML Price Prediction (Multi-Horizon)
     if USE_ML:
         try:
-            ml_signal = detect_and_label_reversals(df)
-            d['TrendReversal_ML'] = ml_signal
+            # Pass the full df with historical OHLCV data
+            prediction_result = predict_best_horizon(df, min_confidence=0.40)
+            if prediction_result is not None:
+                d['ML_Target_Price'] = round(prediction_result['price'], 2)
+                d['ML_Target_Price_Days'] = prediction_result['days']
+                d['ML_Confidence_Score'] = round(prediction_result['confidence'], 2)
+                d['ML_Target_Return_Pct'] = round(prediction_result['return_pct'], 2)
+            else:
+                d['ML_Target_Price'] = pd.NA
+                d['ML_Target_Price_Days'] = pd.NA
+                d['ML_Confidence_Score'] = pd.NA
+                d['ML_Target_Return_Pct'] = pd.NA
         except Exception as e:
-            my_logger.info(f"[detect_and_label_reversals error for {underlying}: {e}]")
-            d['TrendReversal_ML'] = pd.NA
+            my_logger.info(f"[ML_Predict_Price error for {underlying}: {e}]")
+            d['ML_Target_Price'] = pd.NA
+            d['ML_Target_Price_Days'] = pd.NA
+            d['ML_Confidence_Score'] = pd.NA
+            d['ML_Target_Return_Pct'] = pd.NA
     else:
-        d['TrendReversal_ML'] = pd.NA   
+        d['ML_Target_Price'] = pd.NA
+        d['ML_Target_Price_Days'] = pd.NA
+        d['ML_Confidence_Score'] = pd.NA
+        d['ML_Target_Return_Pct'] = pd.NA
 
     d['ScanDate'] = strUtcNow()
 
@@ -1059,7 +1077,8 @@ def bulk_insert_dataframe(table_name: str, df: pd.DataFrame, chunksize: int = 50
     # Force numeric types to prevent truncation errors
     numeric_cols = ['Open', 'High', 'Low', 'Close', 'Volume', 'ADX', 'SMA200', 'EMA50', 'EMA20', 'CCI', 'RSI', 
                     'TodayPrice', 'marketCap', 'High52', 'Low52', 'Pct2H52', 'PctfL52', 'LastTrendDays', 
-                    'SignalClassifier_Rules', 'SignalClassifier_ML']
+                    'SignalClassifier_Rules', 'SignalClassifier_ML', 'ML_Target_Price', 
+                    'ML_Target_Price_Days', 'ML_Confidence_Score', 'ML_Target_Return_Pct']
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)

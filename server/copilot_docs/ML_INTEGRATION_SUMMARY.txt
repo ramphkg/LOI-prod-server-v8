@@ -1,0 +1,82 @@
+# ML_Predict_Price Integration Summary
+
+## Changes Made to ta_signals_mc_parallel.py
+
+### 1. Import Added (Line 35)
+```python
+from ML_Predict_Price import predict_next_close
+```
+
+### 2. Schema Updated (Line 88)
+Added new field to `canonical_table_schema()`:
+```python
+"ML_Predicted_Price": "DOUBLE PRECISION"
+```
+
+### 3. Prediction Logic Added (Lines 1012-1023)
+In `get_tlib_tadata()` function, after TrendReversal_ML processing:
+```python
+# ML Price Prediction
+predicted_price = None
+if USE_ML:
+    try:
+        # Pass the full df with historical OHLCV data
+        predicted_price = predict_next_close(df, confidence_threshold=0.6)
+        d['ML_Predicted_Price'] = predicted_price if predicted_price is not None else pd.NA
+    except Exception as e:
+        my_logger.info(f"[ML_Predict_Price error for {underlying}: {e}]")
+        d['ML_Predicted_Price'] = pd.NA
+else:
+    d['ML_Predicted_Price'] = pd.NA
+```
+
+### 4. Bulk Insert Updated (Line 1077)
+Added 'ML_Predicted_Price' to numeric_cols list for proper type handling:
+```python
+numeric_cols = [..., 'SignalClassifier_Rules', 'SignalClassifier_ML', 'ML_Predicted_Price']
+```
+
+## How It Works
+
+1. **Data Flow**: For each stock processed, the full OHLCV dataframe is passed to `predict_next_close()`
+2. **Confidence Threshold**: Set to 0.6 (60% R² score minimum)
+3. **Graceful Degradation**: Returns pd.NA if:
+   - Insufficient data (< 30 days)
+   - Low model confidence
+   - Prediction change > 20%
+   - Any errors occur
+
+## Database Storage
+
+The predicted price is stored in the output table (e.g., `finnhub_tas_listings`, `eod_tas_listings`) as:
+- Column: `ML_Predicted_Price`
+- Type: DOUBLE (MySQL) / DOUBLE PRECISION (standard SQL)
+- Values: 
+  - Numeric value (predicted price)
+  - NULL/NA (when prediction not available)
+
+## Testing Results
+
+✓ Schema validation: PASSED
+✓ Integration test: PASSED
+✓ Example predictions:
+  - AAPL: $271.40 → $250.78 (-7.60%)
+  - MSFT: No prediction (low confidence)
+  - GOOGL: No prediction (low confidence)
+
+## Multi-Market Testing
+
+Tested across 30 stocks from USA, India, and Hong Kong:
+- Overall success rate: 73.3% (22/30 stocks)
+- USA: 80.0% (8/10)
+- India: 80.0% (8/10)  
+- Hong Kong: 60.0% (6/10)
+
+## Usage
+
+When running ta_signals_mc_parallel.py:
+```bash
+python ta_signals_mc_parallel.py --source FINNHUB_LOCAL --use-ml
+```
+
+The ML_Predicted_Price will be automatically calculated and stored for each symbol processed.

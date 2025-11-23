@@ -30,20 +30,20 @@ sleep 5
 echo "IN_ALL (EOD_LOCAL)"
 python ta_signals_mc_parallel.pyc -w IN_ALL --source EOD_LOCAL --use_ml=yes
 sleep 5
-python tas_swing_scoring.pyc -w IN_ALL -s EOD --top_n 25 --use_ml_preferred yes --update_db yes
+python tas_swing_scoring.pyc -w IN_ALL -s EOD 
 sleep 5
 
 echo "HK_ALL (EOD_LOCAL)"
 python ta_signals_mc_parallel.pyc -w HK_ALL --source EOD_LOCAL --use_ml=yes
 sleep 5
-python tas_swing_scoring.pyc -w HK_ALL -s EOD --top_n 25 --use_ml_preferred yes --update_db yes
+python tas_swing_scoring.pyc -w HK_ALL -s EOD 
 sleep 5
 
 # --- Handle US  ---
 echo "US_ALL (FINNHUB_LOCAL)"
 python ta_signals_mc_parallel.pyc -w US_ALL --source FINNHUB_LOCAL --use_ml=yes
 sleep 5
-python tas_swing_scoring.pyc -w US_ALL -s FINNHUB --top_n 25 --use_ml_preferred yes --update_db yes
+python tas_swing_scoring.pyc -w US_ALL -s FINNHUB 
 sleep 5
 
 echo -e "\n-----------------------COMPLETED----------------------------------------------"
