@@ -699,6 +699,10 @@ def export_rankings_db(df: pd.DataFrame, country: str, top_n: int = 25) -> None:
         CompositeScore FLOAT,
         CompositeRank INT,
         SwingTrade_Signal VARCHAR(20),
+        ML_Target_Price FLOAT,
+        ML_Target_Return_Pct FLOAT,
+        ML_Target_Price_Days INT,
+        ML_Confidence_Score FLOAT,
         ScanDate DATETIME,
         INDEX idx_country (CountryName),
         INDEX idx_symbol (Symbol),
@@ -738,6 +742,7 @@ def export_rankings_db(df: pd.DataFrame, country: str, top_n: int = 25) -> None:
         'TechScore_SMA_Dist', 'TechScore_RSI', 'TechScore_Pct2H52', 'TechScore_GEM',
         'TechScore_Total', 'TechScore_Rank',
         'CompositeScore', 'CompositeRank', 'SwingTrade_Signal',
+        'ML_Target_Price', 'ML_Target_Return_Pct', 'ML_Target_Price_Days', 'ML_Confidence_Score',
         'ScanDate'
     ]
     
