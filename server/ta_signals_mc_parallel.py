@@ -628,6 +628,13 @@ def get_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
         else:
             df['BB_width'] = 0.0
     
+    # Ensure critical columns are filled with appropriate defaults to avoid None/NaN comparison errors
+    df['BB_width'] = df['BB_width'].fillna(0.0)
+    if 'ATR' in df.columns:
+        df['ATR'] = df['ATR'].fillna(0.0)
+    if 'ADX' in df.columns:
+        df['ADX'] = df['ADX'].fillna(0.0)
+    
     return df
 
 # Config with thresholds (tune to your universe)
@@ -663,6 +670,18 @@ def get_primary_secondary_trends(df: pd.DataFrame, config: dict = DEFAULT_INDICA
     # INPUT ASSUMPTIONS: indicators.py populated these columns:
     # 'EMA20', 'EMA50', 'EMA200', 'ADX', 'DITrend' (strings 'Bull'/'Bear'), 'BB_width' (bb_high - bb_low)/price, 'ATR', 'Close'
     # If not present, compute them in indicators.py before calling this function.
+    
+    # Fill NaN/None values to prevent comparison errors
+    numeric_cols = ['EMA20', 'EMA50', 'EMA200', 'ADX', 'BB_width', 'ATR', 'Close']
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna(0.0)
+    
+    # Ensure DITrend column exists with proper default
+    if 'DITrend' in df.columns:
+        df['DITrend'] = df['DITrend'].fillna('Neutral')
+    else:
+        df['DITrend'] = 'Neutral'
 
     # 1) ADX strength categories (re-using your helper idea)
     adx_conditions = [
@@ -935,7 +954,9 @@ def get_tlib_tadata(underlying: str, price_source: str, my_logger, df: Optional[
     d['TodayPrice'] = float(result.get('TodayPrice', 0.0) or 0.0)
     d['marketCap'] = float(result.get('marketCap', 0.0) or 0.0)
     d['GEM_Rank'] = str(result.get('GEM_Rank', '') or '')
-    d['CountryName'] = str(result.get('CountryName') or pd.NA)
+    # Keep CountryName as None/pd.NA instead of converting to string '<NA>'
+    country = result.get('CountryName')
+    d['CountryName'] = country if country else pd.NA
     d['IndustrySector'] = str(result.get('Sector', '') or '')
     d['High52'] = float(result.get('High52', 0.0) or 0.0)
     d['Low52'] = float(result.get('Low52', 0.0) or 0.0)

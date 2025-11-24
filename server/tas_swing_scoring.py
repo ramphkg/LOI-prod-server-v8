@@ -233,26 +233,52 @@ def compute_pattern_ranking_with_history(symbols: list, source: str, config: Dic
     price_table = 'finnhub_stock_prices' if source.upper().startswith('FINNHUB') else 'eod_stock_prices'
     
     results = []
-    db_conn = getDbConnection()
     
-    for idx, symbol in enumerate(symbols):
-        if (idx + 1) % 100 == 0:
-            LOG.info(f"  Progress: {idx + 1}/{len(symbols)} symbols processed")
-        
-        try:
-            # Fetch recent price history
-            query = text(f"""
-                SELECT Date, Close 
-                FROM {price_table}
-                WHERE Symbol = :symbol 
-                ORDER BY Date DESC 
-                LIMIT {cfg['lookback_days'] + 10}
-            """)
+    with getDbConnection() as db_conn:
+        for idx, symbol in enumerate(symbols):
+            if (idx + 1) % 100 == 0:
+                LOG.info(f"  Progress: {idx + 1}/{len(symbols)} symbols processed")
             
-            price_df = pd.read_sql(query, db_conn, params={'symbol': symbol})
-            
-            if price_df.empty:
-                LOG.debug(f"No price history for {symbol}")
+            try:
+                # Fetch recent price history
+                query = text(f"""
+                    SELECT Date, Close 
+                    FROM {price_table}
+                    WHERE Symbol = :symbol 
+                    ORDER BY Date DESC 
+                    LIMIT {cfg['lookback_days'] + 10}
+                """)
+                
+                price_df = pd.read_sql(query, db_conn, params={'symbol': symbol})
+                
+                if price_df.empty:
+                    LOG.debug(f"No price history for {symbol}")
+                    results.append({
+                        'Symbol': symbol,
+                        'PricePattern_RecentUpDays': 0,
+                        'PricePattern_PriorDownDays': 0,
+                        'PricePattern_Detected': False,
+                        'PricePattern_Score': 0.0
+                    })
+                    continue
+                
+                # Sort oldest to newest for pattern detection
+                price_df = price_df.sort_values('Date')
+                close_series = price_df['Close']
+                
+                # Detect pattern
+                pattern = detect_price_pattern(close_series, cfg)
+                
+                results.append({
+                    'Symbol': symbol,
+                    'PricePattern_RecentUpDays': pattern['d1_recent_up'],
+                    'PricePattern_PriorDownDays': pattern['d2_prior_down'],
+                    'PricePattern_Detected': pattern['detected'],
+                    'PricePattern_Score': pattern['pattern_score']
+                })
+                
+            except Exception as e:
+                LOG.warning(f"Error processing pattern for {symbol}: {e}")
                 results.append({
                     'Symbol': symbol,
                     'PricePattern_RecentUpDays': 0,
@@ -260,32 +286,6 @@ def compute_pattern_ranking_with_history(symbols: list, source: str, config: Dic
                     'PricePattern_Detected': False,
                     'PricePattern_Score': 0.0
                 })
-                continue
-            
-            # Sort oldest to newest for pattern detection
-            price_df = price_df.sort_values('Date')
-            close_series = price_df['Close']
-            
-            # Detect pattern
-            pattern = detect_price_pattern(close_series, cfg)
-            
-            results.append({
-                'Symbol': symbol,
-                'PricePattern_RecentUpDays': pattern['d1_recent_up'],
-                'PricePattern_PriorDownDays': pattern['d2_prior_down'],
-                'PricePattern_Detected': pattern['detected'],
-                'PricePattern_Score': pattern['pattern_score']
-            })
-            
-        except Exception as e:
-            LOG.warning(f"Error processing pattern for {symbol}: {e}")
-            results.append({
-                'Symbol': symbol,
-                'PricePattern_RecentUpDays': 0,
-                'PricePattern_PriorDownDays': 0,
-                'PricePattern_Detected': False,
-                'PricePattern_Score': 0.0
-            })
     
     pattern_df = pd.DataFrame(results)
     
@@ -614,15 +614,14 @@ def load_tas_listings(watchlist: str, source: str) -> Tuple[pd.DataFrame, str, s
     master_table = config.get('tal_master_tablename', 'finnhub_tas_listings')
     
     # Load from database
-    db_conn = getDbConnection()
-    
-    query = text(f"""
-        SELECT * FROM {master_table}
-        WHERE CountryName = :country
-        ORDER BY Symbol
-    """)
-    
-    df = pd.read_sql(query, db_conn, params={'country': country_name})
+    with getDbConnection() as db_conn:
+        query = text(f"""
+            SELECT * FROM {master_table}
+            WHERE CountryName = :country
+            ORDER BY Symbol
+        """)
+        
+        df = pd.read_sql(query, db_conn, params={'country': country_name})
     
     LOG.info(f"✓ Loaded {len(df)} stocks from {master_table}")
     
@@ -654,7 +653,6 @@ def export_rankings_db(df: pd.DataFrame, country: str, top_n: int = 25) -> None:
     Write only stocks with detected patterns to tas_swing_listings.
     Simplified: filter detected, create table if needed, purge country, insert, verify count.
     """
-    db_conn = getDbConnection()
     db_table = 'tas_swing_listings'
     
     LOG.info("=" * 70)
@@ -707,8 +705,8 @@ def export_rankings_db(df: pd.DataFrame, country: str, top_n: int = 25) -> None:
         INDEX idx_rank (CompositeRank)
     )"""
     try:
-        db_conn.execute(text(create_sql))
-        db_conn.commit()
+        with getDbConnection() as db_conn:
+            db_conn.execute(text(create_sql))
         LOG.info(f"✓ Ensured {db_table} exists")
     except Exception as e:
         LOG.warning(f"Table creation warning (may already exist): {e}")
@@ -747,25 +745,24 @@ def export_rankings_db(df: pd.DataFrame, country: str, top_n: int = 25) -> None:
     LOG.info(f"Exporting {len(df_export)} rows with {len(df_export.columns)} columns")
     
     try:
-        # Purge existing rows for this country
-        LOG.info(f"Purging existing {country} rows from {db_table}...")
-        purge_sql = text(f"DELETE FROM {db_table} WHERE CountryName = :country")
-        result = db_conn.execute(purge_sql, {'country': country})
-        db_conn.commit()
-        LOG.info(f"Purged rows for {country}")
-        
-        # Insert new rows
-        LOG.info(f"Inserting {len(df_export)} rows...")
-        df_export.to_sql(db_table, db_conn, if_exists='append', index=False, chunksize=500)
-        db_conn.commit()
-        LOG.info(f"✓ Inserted {len(df_export)} rows into {db_table}")
-        
-        # Verify
-        verify_sql = text(f"SELECT COUNT(*) FROM {db_table} WHERE CountryName = :country")
-        result = db_conn.execute(verify_sql, {'country': country})
-        count = result.fetchone()[0]
-        LOG.info(f"✓ Verified: {count} rows in {db_table} for {country}")
-        print(f"\n[SUCCESS] {count} rows written to {db_table} for {country}\n")
+        with getDbConnection() as db_conn:
+            # Purge existing rows for this country
+            LOG.info(f"Purging existing {country} rows from {db_table}...")
+            purge_sql = text(f"DELETE FROM {db_table} WHERE CountryName = :country")
+            result = db_conn.execute(purge_sql, {'country': country})
+            LOG.info(f"Purged rows for {country}")
+            
+            # Insert new rows
+            LOG.info(f"Inserting {len(df_export)} rows...")
+            df_export.to_sql(db_table, db_conn, if_exists='append', index=False, chunksize=500)
+            LOG.info(f"✓ Inserted {len(df_export)} rows into {db_table}")
+            
+            # Verify
+            verify_sql = text(f"SELECT COUNT(*) FROM {db_table} WHERE CountryName = :country")
+            result = db_conn.execute(verify_sql, {'country': country})
+            count = result.fetchone()[0]
+            LOG.info(f"✓ Verified: {count} rows in {db_table} for {country}")
+            print(f"\n[SUCCESS] {count} rows written to {db_table} for {country}\n")
         
     except Exception as e:
         LOG.error(f"DB write failed: {e}")
